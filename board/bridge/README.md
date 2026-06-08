@@ -77,6 +77,37 @@ Tooling + sources are confirmed lined up: TinyUSB 0.20 (NCM + dwc2 STM32H7) and 
 2.2 are cloned at `~/github/tinyusb` + `~/github/lwip`; the macOS build env builds the
 stock `panda_h7` firmware; and the bridge logic compiles against the pinned headers.
 
+## Status: COMPILES + LINKS (unvalidated — no hardware yet)
+
+`board/obj/panda_bridge/main.{elf,bin}` builds end-to-end (text ~94 KB, data ~23 KB,
+bss ~455 KB — fits the H7 RAM regions). Build it:
+
+```bash
+board/bridge/vendor.sh          # one-time: copy TinyUSB/lwIP from ~/github clones
+board/bridge/macos_build.sh board/obj/panda_bridge/main.bin
+```
+
+How it's wired (`main_bridge.c` is the unity TU):
+- Reuses the panda's `clock_init` / `peripherals_init` / `current_board->init()` /
+  `microsecond_timer_init` / `can_init_all`, then routes the **OTG_HS IRQ to
+  TinyUSB's `dcd_int_handler`** instead of the panda USB class.
+- TinyUSB (NCM) + lwIP + dhserver/dnserver compile as relaxed TUs (`renv` in
+  SConscript) and link against the unity TU's globals (incl. `memcpy`/`memset`).
+- `bridge_libc.c` fills the libc gaps under `-nostdlib` (`memmove`/`strlen`/`strncmp`/
+  `atoi`/`strcmp`/`strcpy`), a dummy `_ctype_` (lwIP IP-string parsing is unused),
+  and `SystemCoreClock = 240 MHz` (for dwc2 timing).
+
+**Caveats to resolve on hardware (it links, but isn't proven to run):**
+- *Path-A coupling:* to make `current_board->init()` link, `main_bridge.c` includes
+  the full panda driver/comms/USB header set, so the panda USB class is compiled but
+  **dormant** (we never call `usb_init()`; only TinyUSB drives OTG). For production,
+  switch to a **minimal init** (manual clock + USB/CAN GPIO AF, no board/comms/SPI)
+  to drop the dead weight and remove any chance of the two USB paths interfering.
+- *bss ~455 KB* — lwIP pool sizing (`lwipopts.h` `LWIP_HIGH_THROUGHPUT`) may want
+  trimming for headroom.
+- *Validate in order:* NCM enumerates on iPad → DHCP lease → app Connected → CAN
+  flows. The clock/PHY/GPIO bring-up is the part that "links but may not enumerate."
+
 ## To finish (best done with the panda in hand)
 
 1. **SCons `panda_bridge` target.** The stock `build_project` compiles a single

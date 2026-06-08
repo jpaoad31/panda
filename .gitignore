@@ -44,3 +44,9 @@ TASK.md
 # macOS folder-local build env (board/bridge/macos_build.sh)
 .uv-cache/
 .uv-python/
+
+# vendored TinyUSB/lwIP for the bridge build (board/bridge/vendor.sh)
+board/bridge/vendor/
+
+# clangd / tooling caches
+.cache/

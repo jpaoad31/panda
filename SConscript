@@ -172,5 +172,60 @@ build_project("panda_jungle_h7", base_project_h7, "./board/jungle/main.c", flags
 # body fw
 build_project("body_h7", base_project_h7, "./board/body/main.c", ["-DPANDA_BODY"])
 
+# RoadStud USB-NCM bridge fw (board/bridge/) — only if sources are vendored.
+_bridge_vendor = "board/bridge/vendor"
+if os.path.exists(f"{_bridge_vendor}/tinyusb/src") and os.path.exists(f"{_bridge_vendor}/lwip/src"):
+  _bdir = Dir("./board/obj/panda_bridge/")
+  _bflags = base_project_h7["FLAGS"] + common_flags + [
+    "-mlittle-endian", "-mthumb", "-nostdlib", "-fno-builtin", "-std=gnu11",
+    f"-T{File(base_project_h7['LINKER_SCRIPT']).srcnode().relpath}",
+    "-fsingle-precision-constant", "-Os", "-g",
+  ]
+  _bcpp = [
+    Dir("./"), "./board/stm32h7/inc", opendbc.INCLUDE_PATH,
+    "board/bridge",
+    f"{_bridge_vendor}/tinyusb/src",
+    f"{_bridge_vendor}/tinyusb/networking",
+    f"{_bridge_vendor}/lwip/src/include",
+  ]
+  # strict env for our own code (unity TU); relaxed env for vendored + glue.
+  benv = Environment(
+    ENV=os.environ, CC=PREFIX + 'gcc', AS=PREFIX + 'gcc',
+    OBJCOPY=PREFIX + 'objcopy', OBJDUMP=PREFIX + 'objdump',
+    CFLAGS=_bflags + ["-Wall", "-Wextra", "-Wstrict-prototypes", "-Werror", "-fmax-errors=1"],
+    ASFLAGS=_bflags, LINKFLAGS=_bflags, CPPPATH=_bcpp,
+    ASCOM="$AS $ASFLAGS -o $TARGET -c $SOURCES",
+    BUILDERS={'Objcopy': Builder(generator=objcopy, suffix='.bin', src_suffix='.elf')},
+    tools=["default"],
+  )
+  renv = benv.Clone()
+  renv['CFLAGS'] = _bflags + ["-Wno-error", "-Wno-unused-parameter"]
+
+  _tusb = [
+    f"{_bridge_vendor}/tinyusb/src/tusb.c",
+    f"{_bridge_vendor}/tinyusb/src/common/tusb_fifo.c",
+    f"{_bridge_vendor}/tinyusb/src/device/usbd.c",
+    f"{_bridge_vendor}/tinyusb/src/class/net/ncm_device.c",
+    f"{_bridge_vendor}/tinyusb/src/portable/synopsys/dwc2/dcd_dwc2.c",
+    f"{_bridge_vendor}/tinyusb/src/portable/synopsys/dwc2/dwc2_common.c",
+    f"{_bridge_vendor}/tinyusb/networking/dhserver.c",
+    f"{_bridge_vendor}/tinyusb/networking/dnserver.c",
+  ]
+  _lwip = Glob(f"{_bridge_vendor}/lwip/src/core/*.c") + \
+          Glob(f"{_bridge_vendor}/lwip/src/core/ipv4/*.c") + \
+          [f"{_bridge_vendor}/lwip/src/netif/ethernet.c"]
+  _glue = ["board/bridge/usb_descriptors.c", "board/bridge/lwip_glue.c",
+           "board/bridge/bridge_can.c", "board/bridge/bridge_libc.c",
+           "board/bridge/tusb_shim.c"]
+
+  _vobjs = [renv.Object(s) for s in (_tusb + _lwip + _glue)]
+  _bstartup = benv.Object(base_project_h7["STARTUP_FILE"])
+  # main_bridge pulls panda driver headers written for the full main.c context, so
+  # some statics are unused here -> build it relaxed too.
+  _bmain = renv.Object("board/bridge/main_bridge.c")
+  _belf = benv.Program(f"{_bdir}/main.elf", [_bstartup, _bmain] + _vobjs,
+    LINKFLAGS=[f"-Wl,--section-start,.isr_vector={base_project_h7['APP_START_ADDRESS']}"] + _bflags)
+  benv.Objcopy(f"{_bdir}/main.bin", _belf)
+
 # test files
 SConscript('tests/libpanda/SConscript')

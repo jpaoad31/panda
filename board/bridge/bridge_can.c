@@ -18,11 +18,15 @@
 #include "lwip/pbuf.h"
 #include "lwip/ip_addr.h"
 
-// Panda CAN: CANPacket_t, can_rx_q, can_pop(), can_send(). Provided by the panda
-// board headers included by the firmware entry (main_bridge.c) before this TU is
-// linked; declared here for clarity.
+// CANPacket_t (clean, no CMSIS deps).
+#include "opendbc/safety/can.h"
 #include "board/bridge/bridge_protocol.h"
 
+// can_ring is panda-internal (board/drivers/drivers.h) and drags in CMSIS-typed
+// driver decls. We only ever pass &can_rx_q to can_pop and never touch its fields,
+// so an opaque forward declaration keeps those heavy headers out of this TU. The
+// real definitions live in the unity TU (main_bridge.c).
+typedef struct can_ring can_ring;
 extern can_ring can_rx_q;
 bool can_pop(can_ring *q, CANPacket_t *elem);
 void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook);
