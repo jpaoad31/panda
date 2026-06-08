@@ -66,20 +66,34 @@ Two macOS gotchas the script handles (the stock docs miss these):
 | File | Status | Role |
 |------|--------|------|
 | `bridge_protocol.h` | ✅ done, hardware-independent | Encode/decode the bridge wire format on `CANPacket_t`. Mirrors the app byte-for-byte. |
-| `bridge_can.h/.c` | ✅ done (compiles only in the assembled build) | UDP :5555 server: client latch, ≤64-frame batching, idle keepalive, RX drain from `can_rx_q`, TX inject via `can_send`. Faithful port of `main_usb.c`'s UDP section. |
+| `bridge_can.h/.c` | ✅ done + **validated** | UDP :5555 server: client latch, ≤64-frame batching, idle keepalive, RX drain from `can_rx_q`, TX inject via `can_send`. Faithful port of `main_usb.c`'s UDP section. **Verified to compile cleanly against the pinned lwIP 2.2 + TinyUSB 0.20 headers (clang `-fsyntax-only`, 0 errors).** |
 | `tusb_config.h` | ✅ starting point | TinyUSB config for STM32H7 NCM (rhport 1, full speed, `CFG_TUD_NCM=1`). |
-| `main_bridge.c` | 🟨 template | Shows how it all assembles. `[COPY]` = copy from the Pico example; `[PANDA]` = adapt to this fork. |
+| `lwipopts.h` | ✅ staged (from 0.20 example) | lwIP NO_SYS config, version-matched. |
+| `arch/` | ✅ staged (from 0.20 example) | lwIP `cc.h` / `bpstruct.h` / `epstruct.h`. |
+| `usb_descriptors.ncm.reference.c` | 📋 reference | The 0.20 example's net descriptors — trim to NCM-only for the final `usb_descriptors.c`. |
+| `main_bridge.c` | 🟨 template | Shows how it all assembles. `[COPY]` = copy from the example; `[PANDA]` = adapt to this fork. |
 
-## To finish (on hardware)
+Tooling + sources are confirmed lined up: TinyUSB 0.20 (NCM + dwc2 STM32H7) and lwIP
+2.2 are cloned at `~/github/tinyusb` + `~/github/lwip`; the macOS build env builds the
+stock `panda_h7` firmware; and the bridge logic compiles against the pinned headers.
 
-1. **Vendor TinyUSB + lwIP** into a new SCons build target (mirror `build_project`
-   for `panda_h7` in `SConscript`; produce a separate `panda_bridge` binary). Add
-   TinyUSB (`src/tusb.c`, `class/net/*`, `portable/synopsys/dwc2/*`) and lwIP core.
-2. **Copy verbatim from `canbridge`:** `usb_descriptors.c` (NCM, `bcdUSB=0x0201`,
-   BOS/MS-OS-2.0), the `init_lwip()` / `service_traffic()` / `linkoutput_fn` glue
-   and `dhcp_config` from `src/main_usb.c`, `include/usb/lwipopts.h`, and the
-   `dhcpserver/`. Keep the **router/DNS DHCP options = 0.0.0.0** (this is what lets
-   iOS keep WiFi/cellular as its default route).
+## To finish (best done with the panda in hand)
+
+1. **SCons `panda_bridge` target.** The stock `build_project` compiles a single
+   `main` TU with `-nostdlib -Werror -Wextra -Wstrict-prototypes`. TinyUSB + lwIP
+   are many `.c` files that won't tolerate those flags, so the target needs: (a) a
+   separate env that compiles the vendored sources with relaxed warnings
+   (`-Wno-error`, no `-Wstrict-prototypes`), (b) a libc story under `-nostdlib`
+   (link newlib `libc_nano`/`libgcc`, or provide `memcpy`/`memset`/etc.), (c) the
+   vendored object list linked into the `main.elf` Program(). Source set: TinyUSB
+   `src/tusb.c` + `src/common` + `src/device` + `src/class/net/ncm_device.c` +
+   `src/portable/synopsys/dwc2/dcd_dwc2.c`; lwIP `core/*` + `core/ipv4/*` +
+   `netif/ethernet.c`; `lib/networking/dhserver.c` + `dnserver.c`.
+2. **Glue (mostly staged here):** finalize `usb_descriptors.c` (trim the staged
+   reference to NCM-only, keep `bcdUSB=0x0201` + BOS/MS-OS-2.0); bring in the
+   `init_lwip()` / `service_traffic()` / `linkoutput_fn` + `dhcp_config` from the
+   0.20 example or the Pico `main_usb.c`. Keep the **router/DNS DHCP options =
+   0.0.0.0** (this is what lets iOS keep WiFi/cellular as its default route).
 3. **`[PANDA]` init:** clock + OTG_HS (FS PHY, device) — reuse this fork's existing
    USB clock setup from `board/main.c`/`llusb.h`; FDCAN bring-up for the buses to
    bridge; a `panda_millis()` from the existing microsecond timer.
