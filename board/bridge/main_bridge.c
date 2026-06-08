@@ -163,7 +163,15 @@ int main(void) {
   bridge_net_init();
   bridge_can_init();
 
+  // Software liveness watchdog: records FAULT_HEARTBEAT_LOOP_WATCHDOG if the main
+  // loop stalls past the threshold (reported to the app; does not self-reset). Fed
+  // every iteration, so it directly reflects loop health — e.g. a wedged TinyUSB
+  // xmit-wait or lwIP deadlock would trip it. NOTE: for true auto-recovery on a car
+  // (no host to power-cycle a hung bridge over USB), arm the hardware IWDG too.
+  simple_watchdog_init(FAULT_HEARTBEAT_LOOP_WATCHDOG, (3U * 1000000U / 8U));
+
   while (true) {
+    simple_watchdog_kick();
     tud_task_ext(0U, false);     // service USB
     bridge_net_service();        // pump lwIP timers + RX
     bridge_can_poll(bridge_now_ms());

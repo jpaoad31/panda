@@ -115,29 +115,37 @@ What's left needs the device:
 
 1. **Smoke test (path A as-is).** Flash, plug into iPad: does it enumerate as NCM →
    get a 192.168.4.x DHCP lease → app shows Connected (UDP keepalive) → CAN frames
-   appear? Fastest yes/no. **If it boot-loops, suspect an unfed panda watchdog** —
-   that's the cue to do step 2. A status LED mirroring the Pico's
+   appear? Fastest yes/no. A status LED mirroring the Pico's
    cyan→blue→purple→green ladder makes bring-up much easier.
 
 2. **Refactor `main_bridge.c` to a MINIMAL init (the cleanup).** Today it includes
    the full panda header set and calls `current_board->init()` so everything links,
-   which also boots the whole panda runtime (SPI/comms/fan/harness/relays + any
-   watchdogs) and compiles a dormant panda USB class. For something that runs on a
-   moving car, replace that with only what the bridge needs:
+   which also boots the whole panda runtime (SPI/comms/fan/harness/relays) and
+   compiles a dormant panda USB class. For something that runs on a moving car,
+   replace that with only what the bridge needs:
    - `clock_init()` + `peripherals_init()` (clock + RCC enables),
    - USB GPIO AF for PA11/PA12 (replicate `gpio_usb_init()`, currently static in
      `peripherals.h`) — **not** the full `current_board->init()`,
    - FDCAN GPIO AF + `can_init_all()`,
    - `microsecond_timer_init()`,
-   - drop `board/drivers/usb.h`, `can_comms.h`, `main_comms.h`, `pwm.h`, `bootkick.h`,
-     `simple_watchdog.h` and the copied `set_safety_mode`/`is_car_safety_mode`.
-   Payoff: no unfed watchdog resets, no stray IRQs, no second USB stack in the image,
-   smaller/debuggable firmware. See "what the minimal init gets us" — it's the
-   production shape, not needed just to *try* enumeration.
+   - drop `board/drivers/usb.h`, `can_comms.h`, `main_comms.h`, `pwm.h`, `bootkick.h`
+     and the copied `set_safety_mode`/`is_car_safety_mode`.
+   Payoff: no stray IRQs/peripherals running unserviced, no second USB stack in the
+   image, smaller/debuggable firmware. It's the production shape, not needed just to
+   *try* enumeration.
 
-3. **Trim lwIP bss** (~455 KB): tune `lwipopts.h` pool sizes / `LWIP_HIGH_THROUGHPUT`.
+3. **Watchdog — keep it.** `simple_watchdog` is software-only: it records
+   `FAULT_HEARTBEAT_LOOP_WATCHDOG` (reported to the app) if the main loop stalls past
+   ~375 ms; it does **not** self-reset, and there is **no** active hardware IWDG in
+   this firmware. `main_bridge.c` already inits + kicks it each loop, giving a real
+   liveness signal (e.g. a wedged TinyUSB xmit-wait would trip it). Keep this through
+   the minimal-init refactor. For true auto-recovery on a car — where no host can
+   power-cycle a hung bridge over USB (unlike a comma 3) — **arm the hardware IWDG1**
+   (`IND_WDG`) and refresh it in the loop. Deliberate add; validate timing on device.
 
-4. **Bootstub + signing.** The target builds `main.{elf,bin}` only; add the bootstub
+4. **Trim lwIP bss** (~455 KB): tune `lwipopts.h` pool sizes / `LWIP_HIGH_THROUGHPUT`.
+
+5. **Bootstub + signing.** The target builds `main.{elf,bin}` only; add the bootstub
    build + `sign.py` step (mirror `build_project`) before it can actually boot.
 
 ## Safety mode
