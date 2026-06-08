@@ -40,3 +40,7 @@ mull.yml
 
 .claude/
 TASK.md
+
+# macOS folder-local build env (board/bridge/macos_build.sh)
+.uv-cache/
+.uv-python/
