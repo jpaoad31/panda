@@ -108,33 +108,37 @@ How it's wired (`main_bridge.c` is the unity TU):
 - *Validate in order:* NCM enumerates on iPad → DHCP lease → app Connected → CAN
   flows. The clock/PHY/GPIO bring-up is the part that "links but may not enumerate."
 
-## To finish (best done with the panda in hand)
+## Remaining work (on the panda)
 
-1. **SCons `panda_bridge` target.** The stock `build_project` compiles a single
-   `main` TU with `-nostdlib -Werror -Wextra -Wstrict-prototypes`. TinyUSB + lwIP
-   are many `.c` files that won't tolerate those flags, so the target needs: (a) a
-   separate env that compiles the vendored sources with relaxed warnings
-   (`-Wno-error`, no `-Wstrict-prototypes`), (b) a libc story under `-nostdlib`
-   (link newlib `libc_nano`/`libgcc`, or provide `memcpy`/`memset`/etc.), (c) the
-   vendored object list linked into the `main.elf` Program(). Source set: TinyUSB
-   `src/tusb.c` + `src/common` + `src/device` + `src/class/net/ncm_device.c` +
-   `src/portable/synopsys/dwc2/dcd_dwc2.c`; lwIP `core/*` + `core/ipv4/*` +
-   `netif/ethernet.c`; `lib/networking/dhserver.c` + `dnserver.c`.
-2. **Glue (mostly staged here):** finalize `usb_descriptors.c` (trim the staged
-   reference to NCM-only, keep `bcdUSB=0x0201` + BOS/MS-OS-2.0); bring in the
-   `init_lwip()` / `service_traffic()` / `linkoutput_fn` + `dhcp_config` from the
-   0.20 example or the Pico `main_usb.c`. Keep the **router/DNS DHCP options =
-   0.0.0.0** (this is what lets iOS keep WiFi/cellular as its default route).
-3. **`[PANDA]` init:** clock + OTG_HS (FS PHY, device) — reuse this fork's existing
-   USB clock setup from `board/main.c`/`llusb.h`; FDCAN bring-up for the buses to
-   bridge; a `panda_millis()` from the existing microsecond timer.
-4. **Wire `bridge_can_*`** into the main loop (see `main_bridge.c`): `tud_task()` →
-   `service_traffic()` → `bridge_can_poll(panda_millis())`. Call `bridge_can_init()`
-   after lwIP is up.
-5. **Verify in order** (each step is a known checkpoint): NCM enumerates on the iPad
-   → host gets a 192.168.4.x DHCP lease → app shows Connected (the UDP keepalive)
-   → real CAN frames appear in the app. A status LED mirroring the Pico's
+The build/link, SCons target, glue, and init wiring are **done** (see Status above).
+What's left needs the device:
+
+1. **Smoke test (path A as-is).** Flash, plug into iPad: does it enumerate as NCM →
+   get a 192.168.4.x DHCP lease → app shows Connected (UDP keepalive) → CAN frames
+   appear? Fastest yes/no. **If it boot-loops, suspect an unfed panda watchdog** —
+   that's the cue to do step 2. A status LED mirroring the Pico's
    cyan→blue→purple→green ladder makes bring-up much easier.
+
+2. **Refactor `main_bridge.c` to a MINIMAL init (the cleanup).** Today it includes
+   the full panda header set and calls `current_board->init()` so everything links,
+   which also boots the whole panda runtime (SPI/comms/fan/harness/relays + any
+   watchdogs) and compiles a dormant panda USB class. For something that runs on a
+   moving car, replace that with only what the bridge needs:
+   - `clock_init()` + `peripherals_init()` (clock + RCC enables),
+   - USB GPIO AF for PA11/PA12 (replicate `gpio_usb_init()`, currently static in
+     `peripherals.h`) — **not** the full `current_board->init()`,
+   - FDCAN GPIO AF + `can_init_all()`,
+   - `microsecond_timer_init()`,
+   - drop `board/drivers/usb.h`, `can_comms.h`, `main_comms.h`, `pwm.h`, `bootkick.h`,
+     `simple_watchdog.h` and the copied `set_safety_mode`/`is_car_safety_mode`.
+   Payoff: no unfed watchdog resets, no stray IRQs, no second USB stack in the image,
+   smaller/debuggable firmware. See "what the minimal init gets us" — it's the
+   production shape, not needed just to *try* enumeration.
+
+3. **Trim lwIP bss** (~455 KB): tune `lwipopts.h` pool sizes / `LWIP_HIGH_THROUGHPUT`.
+
+4. **Bootstub + signing.** The target builds `main.{elf,bin}` only; add the bootstub
+   build + `sign.py` step (mirror `build_project`) before it can actually boot.
 
 ## Safety mode
 
