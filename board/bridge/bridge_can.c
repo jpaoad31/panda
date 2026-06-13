@@ -181,6 +181,7 @@ static void process_control(void) {
   if (ctrl_req.length > (uint16_t)sizeof(resp)) { ctrl_req.length = (uint16_t)sizeof(resp); }
   int rlen = comms_control_handler(&ctrl_req, resp);   // may not return (reset/DFU opcodes)
   uint16_t plen = (rlen > 0) ? (uint16_t)rlen : 0U;
+  if (plen > (uint16_t)sizeof(resp)) { plen = (uint16_t)sizeof(resp); }   // defense-in-depth vs a future handler
 
   if (!client_connected) { return; }
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)(RSCR_HDR_LEN + plen), PBUF_RAM);

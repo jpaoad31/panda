@@ -153,6 +153,72 @@ static void bridge_update_led(uint32_t now_ms) {
   led_set(LED_BLUE, b);
 }
 
+// go into SILENT when no heartbeat is received for this many seconds (stock values).
+#define HEARTBEAT_IGNITION_CNT_ON  5U
+#define HEARTBEAT_IGNITION_CNT_OFF 2U
+
+// Port of the safety-relevant subset of board/main.c's 1Hz tick. The bridge's main
+// loop replaces the stock 8Hz TICK_TIMER, so without this the heartbeat / controls
+// bookkeeping never runs and set_safety_mode + heartbeat couldn't gate
+// controls_allowed the way openpilot expects. Driven at 1Hz from main().
+//
+// Deliberate deviations from stock, appropriate for an OBD/bench bridge (not a
+// relay-intercept install):
+//   - peripheral ticks (fan/siren/sound/bootkick/IR/power-save) and the
+//     harness-orientation re-init are omitted.
+//   - the heartbeat-loss -> SILENT revert is gated on is_car_safety_mode(), so the
+//     read-only NOOUTPUT boot state is NOT forced to SILENT when no heartbeat flows
+//     (we only require a heartbeat once the app has armed a real car safety mode).
+static void bridge_safety_tick(void) {
+  static uint32_t controls_allowed_countdown = 0;
+
+  if (heartbeat_counter < UINT32_MAX) { heartbeat_counter += 1U; }
+
+  // disabling the heartbeat is not allowed while in a car safety mode
+  if (is_car_safety_mode(current_safety_mode)) { heartbeat_disabled = false; }
+
+  if (controls_allowed || heartbeat_engaged) {
+    controls_allowed_countdown = 5U;
+  } else if (controls_allowed_countdown > 0U) {
+    controls_allowed_countdown -= 1U;
+  } else {
+    // idle
+  }
+
+  // drop controls if openpilot stops requesting engagement (stock 3-strike check)
+  if (controls_allowed && !heartbeat_engaged) {
+    heartbeat_engaged_mismatches += 1U;
+    if (heartbeat_engaged_mismatches >= 3U) {
+      controls_allowed = false;
+    }
+  } else {
+    heartbeat_engaged_mismatches = 0U;
+  }
+
+  const bool started = harness_check_ignition() || ignition_can;
+
+  // heartbeat gone too long -> revert to SILENT (only while actually armed in a car
+  // mode; NOOUTPUT/ELM327 read-only states are left untouched).
+  if (!heartbeat_disabled && is_car_safety_mode(current_safety_mode)) {
+    if (heartbeat_counter >= (started ? HEARTBEAT_IGNITION_CNT_ON : HEARTBEAT_IGNITION_CNT_OFF)) {
+      controls_allowed_countdown = 0U;
+      heartbeat_lost = true;
+      heartbeat_engaged = false;
+      set_safety_mode(SAFETY_SILENT, 0U);
+    }
+  }
+
+  // clear CAN-detected ignition after a couple seconds of silence
+  if (ignition_can_cnt > 2U) { ignition_can = false; }
+
+  uptime_cnt += 1U;
+  safety_mode_cnt += 1U;
+  ignition_can_cnt += 1U;
+
+  // synchronous safety check
+  safety_tick(&current_safety_config);
+}
+
 // OTG_HS interrupt -> TinyUSB dwc2 handler.
 static void bridge_otg_irq(void) {
   NVIC_DisableIRQ(OTG_HS_IRQn);
@@ -178,10 +244,11 @@ int main(void) {
   enable_fpu();
   microsecond_timer_init();
 
-  // Bring up CAN RX (no safety hooks needed for read forwarding; TX is gated by
-  // the safety model, left in its default SILENT state).
-  can_silent = false;
-  can_init_all();
+  // Bring up CAN via NOOUTPUT: this initialises the safety hooks (so safety_tick
+  // and the TX gate work) while keeping CAN in normal mode — receive everything,
+  // ACK frames, but block all transmits until the app arms a car safety mode.
+  // Mirrors how the stock firmware boots into a known safety state (board/main.c).
+  set_safety_mode(SAFETY_NOOUTPUT, 0U);   // calls can_init_all()
   enable_can_transceivers(true);
 
   // Route the OTG interrupt to TinyUSB.
@@ -205,12 +272,17 @@ int main(void) {
   simple_watchdog_init(FAULT_HEARTBEAT_LOOP_WATCHDOG, (3U * 1000000U / 8U));
 
   uint32_t last_led_ms = 0U;
+  uint32_t last_safety_ms = 0U;
   while (true) {
     simple_watchdog_kick();
     tud_task_ext(0U, false);     // service USB
     bridge_net_service();        // pump lwIP timers + RX
     uint32_t now = bridge_now_ms();
     bridge_can_poll(now);
+    if ((now - last_safety_ms) >= 1000U) {   // 1 Hz safety/heartbeat bookkeeping
+      last_safety_ms = now;
+      bridge_safety_tick();
+    }
     if ((now - last_led_ms) >= 100U) {   // throttle GPIO writes to ~10 Hz
       last_led_ms = now;
       bridge_update_led(now);
