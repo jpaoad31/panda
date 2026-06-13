@@ -68,8 +68,10 @@ static int     tx_buf_len;
 // receive callback but DEFERRED to bridge_can_poll (main-loop context) before
 // calling the handler — some requests re-init CAN / touch the safety hooks (e.g.
 // set_safety_mode), which must not run from the lwIP/USB callback context. A single
-// pending slot is enough: control traffic is low-rate and the app retransmits, so
-// dropping an unprocessed older request is harmless.
+// pending slot is enough: control traffic is low-rate. The app retransmits a request
+// (same req_id) if it misses the reply; we cache the last response and re-ACK a
+// retransmit WITHOUT re-running the handler, so non-idempotent OUT commands
+// (set_safety_mode, set_obd, ...) execute exactly once.
 //
 //   request  "RSCP": [0..3]magic [4]ver=1 [5]opcode(bRequest) [6]req_id [7]flags
 //                    [8..9]param1(LE) [10..11]param2(LE) [12..13]resp_cap(LE) [14..]payload
@@ -82,6 +84,12 @@ static int     tx_buf_len;
 static bool            ctrl_pending;
 static ControlPacket_t ctrl_req;
 static uint8_t         ctrl_req_id;
+
+// Last handled request's reply, cached for idempotent re-ACK of retransmits. The
+// app's req_id is 1..255 (never 0), so last_done_reqid == 0 means "nothing yet".
+static uint8_t  last_done_reqid;
+static uint16_t cached_resp_len;
+static uint8_t  cached_resp[RSCR_HDR_LEN + 64];
 
 static void flush_tx_buffer(void) {
   if ((tx_buf_len == 0) || !client_connected) { return; }
@@ -100,6 +108,16 @@ static void send_keepalive(void) {
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, 1, PBUF_RAM);
   if (p == NULL) { return; }
   *(uint8_t *)p->payload = 0x00U;
+  udp_sendto(can_udp, p, &client_addr, client_port);
+  pbuf_free(p);
+}
+
+// Send a buffer to the current client (used for RSCR control replies + re-ACKs).
+static void send_to_client(const uint8_t *buf, uint16_t len) {
+  if (!client_connected) { return; }
+  struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)len, PBUF_RAM);
+  if (p == NULL) { return; }
+  memcpy(p->payload, buf, (size_t)len);
   udp_sendto(can_udp, p, &client_addr, client_port);
   pbuf_free(p);
 }
@@ -132,19 +150,30 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
   last_client_packet_ms = current_ms;
 
   // RSCP control request: stash it and let bridge_can_poll run the handler in
-  // main-loop context (see the RSCP block above). Can't collide with a CAN batch:
-  // a real frame's byte[5] is an XOR checksum, never the 'P' of the magic at that
-  // offset for a "RSCP"-led datagram, and we match the 4-byte magic explicitly.
+  // main-loop context (the handler may re-init CAN, unsafe in the lwIP callback).
+  // Unambiguous vs a CAN batch: a real frame carries a valid XOR checksum at byte[5]
+  // (bridge_protocol.h), while an RSCP packet's byte[5] is an opcode (always >=0xA8,
+  // never the 0x13 checksum of "RSCP"+ver). So "magic matches AND byte[5] is NOT a
+  // valid CAN checksum" can't be aliased by a genuine CAN frame.
   {
     const uint8_t *d = (const uint8_t *)p->payload;
     if ((p->tot_len >= RSCP_HDR_LEN) &&
         (d[0] == (uint8_t)'R') && (d[1] == (uint8_t)'S') &&
-        (d[2] == (uint8_t)'C') && (d[3] == (uint8_t)'P')) {
+        (d[2] == (uint8_t)'C') && (d[3] == (uint8_t)'P') &&
+        ((uint8_t)(d[0] ^ d[1] ^ d[2] ^ d[3] ^ d[4]) != d[5])) {   // not a valid CAN header
+      uint8_t reqid = d[6];
+      // Retransmit of the request we just handled: re-ACK from cache, don't re-run
+      // (so OUT commands like set_safety_mode execute exactly once).
+      if ((reqid == last_done_reqid) && (cached_resp_len > 0U)) {
+        send_to_client(cached_resp, cached_resp_len);
+        pbuf_free(p);
+        return;
+      }
       ctrl_req.request = d[5];
       ctrl_req.param1  = (uint16_t)((uint16_t)d[8]  | ((uint16_t)d[9]  << 8));
       ctrl_req.param2  = (uint16_t)((uint16_t)d[10] | ((uint16_t)d[11] << 8));
       ctrl_req.length  = (uint16_t)((uint16_t)d[12] | ((uint16_t)d[13] << 8));
-      ctrl_req_id  = d[6];
+      ctrl_req_id  = reqid;
       ctrl_pending = true;
       pbuf_free(p);
       return;
@@ -183,10 +212,8 @@ static void process_control(void) {
   uint16_t plen = (rlen > 0) ? (uint16_t)rlen : 0U;
   if (plen > (uint16_t)sizeof(resp)) { plen = (uint16_t)sizeof(resp); }   // defense-in-depth vs a future handler
 
-  if (!client_connected) { return; }
-  struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)(RSCR_HDR_LEN + plen), PBUF_RAM);
-  if (p == NULL) { return; }
-  uint8_t *o = (uint8_t *)p->payload;
+  // Build the RSCR into the cache so a retransmit can be re-ACKed without re-running.
+  uint8_t *o = cached_resp;
   o[0] = (uint8_t)'R'; o[1] = (uint8_t)'S'; o[2] = (uint8_t)'C'; o[3] = (uint8_t)'R';
   o[4] = RSCP_VERSION;
   o[5] = ctrl_req.request;
@@ -195,8 +222,10 @@ static void process_control(void) {
   o[8] = (uint8_t)(plen & 0xFFU);
   o[9] = (uint8_t)(plen >> 8);
   if (plen > 0U) { memcpy(&o[RSCR_HDR_LEN], resp, plen); }
-  udp_sendto(can_udp, p, &client_addr, client_port);
-  pbuf_free(p);
+  cached_resp_len = (uint16_t)(RSCR_HDR_LEN + plen);
+  last_done_reqid = ctrl_req_id;
+
+  send_to_client(cached_resp, cached_resp_len);
 }
 
 void bridge_can_init(void) {

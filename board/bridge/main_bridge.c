@@ -169,21 +169,13 @@ static void bridge_update_led(uint32_t now_ms) {
 //   - the heartbeat-loss -> SILENT revert is gated on is_car_safety_mode(), so the
 //     read-only NOOUTPUT boot state is NOT forced to SILENT when no heartbeat flows
 //     (we only require a heartbeat once the app has armed a real car safety mode).
+//   - stock's controls_allowed_countdown (used only to time the siren, which the
+//     bridge has no use for) is dropped; the revert is driven by heartbeat_counter.
 static void bridge_safety_tick(void) {
-  static uint32_t controls_allowed_countdown = 0;
-
   if (heartbeat_counter < UINT32_MAX) { heartbeat_counter += 1U; }
 
   // disabling the heartbeat is not allowed while in a car safety mode
   if (is_car_safety_mode(current_safety_mode)) { heartbeat_disabled = false; }
-
-  if (controls_allowed || heartbeat_engaged) {
-    controls_allowed_countdown = 5U;
-  } else if (controls_allowed_countdown > 0U) {
-    controls_allowed_countdown -= 1U;
-  } else {
-    // idle
-  }
 
   // drop controls if openpilot stops requesting engagement (stock 3-strike check)
   if (controls_allowed && !heartbeat_engaged) {
@@ -201,7 +193,6 @@ static void bridge_safety_tick(void) {
   // mode; NOOUTPUT/ELM327 read-only states are left untouched).
   if (!heartbeat_disabled && is_car_safety_mode(current_safety_mode)) {
     if (heartbeat_counter >= (started ? HEARTBEAT_IGNITION_CNT_ON : HEARTBEAT_IGNITION_CNT_OFF)) {
-      controls_allowed_countdown = 0U;
       heartbeat_lost = true;
       heartbeat_engaged = false;
       set_safety_mode(SAFETY_SILENT, 0U);
