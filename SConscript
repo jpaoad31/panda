@@ -225,7 +225,29 @@ if os.path.exists(f"{_bridge_vendor}/tinyusb/src") and os.path.exists(f"{_bridge
   _bmain = renv.Object("board/bridge/main_bridge.c")
   _belf = benv.Program(f"{_bdir}/main.elf", [_bstartup, _bmain] + _vobjs,
     LINKFLAGS=[f"-Wl,--section-start,.isr_vector={base_project_h7['APP_START_ADDRESS']}"] + _bflags)
-  benv.Objcopy(f"{_bdir}/main.bin", _belf)
+  _bbin = benv.Objcopy(f"{_bdir}/main.bin", _belf)
+
+  # Sign the app so the bootstub will accept it and jump to 0x8020000. Mirrors
+  # build_project: SETLEN=1 prepends the length + appends the VERS tag + RSA sig.
+  # In a source (non-RELEASE) build cert_fn is board/certs/debug, which matches the
+  # debug key compiled into any -DALLOW_DEBUG bootstub. No bridge-specific bootstub
+  # is built: the bootstub is app-agnostic (it only sig-checks + jumps to the app
+  # address), so the stock debug bootstub.panda_h7.bin — installed by the panda
+  # library's recover() — is what runs this signed image. See board/bridge/README.md.
+  _bsign_py = File("./board/crypto/sign.py").srcnode().relpath
+  benv.Command("./board/obj/panda_bridge.bin.signed", _bbin,
+    f"SETLEN=1 {_bsign_py} $SOURCE $TARGET {cert_fn}")
+
+  # Dev bootstub: the stock bootstub plus an always-on boot-time flash window
+  # (-DBRIDGE_DEV_FLASH_WINDOW) so a wedged NCM app is always recoverable over USB —
+  # red has no button / exposed BOOT0. DFU it with PandaDFU; see board/bridge/README.md.
+  # The stock bootstub.panda_h7.bin is unchanged (no flag), so production is unaffected.
+  _bs_env = benv.Clone()
+  _bs_env.Append(CFLAGS=["-DBOOTSTUB", "-DBRIDGE_DEV_FLASH_WINDOW"],
+                 ASFLAGS=["-DBOOTSTUB"], LINKFLAGS=["-DBOOTSTUB"])
+  _bs_elf = _bs_env.Program(f"{_bdir}/bootstub.elf",
+    [_bstartup, "./board/crypto/rsa.c", "./board/crypto/sha.c", "./board/bootstub.c"])
+  _bs_env.Objcopy("./board/obj/bootstub.panda_bridge.bin", _bs_elf)
 
 # test files
 SConscript('tests/libpanda/SConscript')

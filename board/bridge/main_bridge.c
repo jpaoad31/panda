@@ -38,8 +38,12 @@ extern void tusb_init_bridge(void);   // thin wrapper, defined below
 // --- bridge glue (separate TUs) ---
 void bridge_net_init(void);      // lwip_glue.c: lwIP + DHCP + DNS
 void bridge_net_service(void);   // lwip_glue.c: sys_check_timeouts()
+bool bridge_net_usb_ready(void);      // lwip_glue.c: NCM device configured
+bool bridge_net_has_dhcp_lease(void); // lwip_glue.c: a host holds a DHCP lease
 void bridge_can_init(void);      // bridge_can.c: UDP :5555 server
 void bridge_can_poll(uint32_t now_ms);
+bool bridge_can_client_connected(void);          // bridge_can.c
+bool bridge_can_frames_flowing(uint32_t now_ms); // bridge_can.c
 
 // TinyUSB needs these; declared minimally to avoid pulling tusb.h into this TU
 // (tusb headers aren't -Werror/-Wstrict-prototypes clean).
@@ -119,6 +123,36 @@ uint32_t bridge_now_ms(void) {
   return microsecond_timer_get() / 1000U;
 }
 
+// Re-flash escape hatch (see board/bridge/README.md "Re-flashing gotcha"). The NCM
+// app has no panda control endpoint, so a host can't request enter-bootstub the
+// normal way; a magic UDP datagram routes here instead. We set the bootstub
+// re-entry magic — it lives in SRAM and survives the soft reset — then reset. Next
+// boot the bootstub runs its flasher (soft-flasher for the app, ST DFU for itself).
+void bridge_request_reboot(bool dfu) {
+  enter_bootloader_mode = dfu ? ENTER_BOOTLOADER_MAGIC : ENTER_SOFTLOADER_MAGIC;
+  NVIC_SystemReset();
+}
+
+// Bring-up status LED (red panda RGB on GPIOE 4/3/2). Worst-state-wins, mirroring
+// the Pico bridge ladder so a sealed box is debuggable at a glance.
+static void bridge_update_led(uint32_t now_ms) {
+  bool r = false, g = false, b = false;
+  if (!bridge_net_usb_ready()) {
+    r = true; g = true; b = true;             // white: USB/NCM not up yet
+  } else if (!bridge_net_has_dhcp_lease()) {
+    g = true; b = true;                       // cyan: NCM up, host has no lease
+  } else if (!bridge_can_client_connected()) {
+    b = true;                                 // blue: lease, app not connected
+  } else if (!bridge_can_frames_flowing(now_ms)) {
+    r = true; b = true;                       // purple: app connected, no CAN yet
+  } else {
+    g = true;                                 // green: healthy, CAN flowing
+  }
+  led_set(LED_RED, r);
+  led_set(LED_GREEN, g);
+  led_set(LED_BLUE, b);
+}
+
 // OTG_HS interrupt -> TinyUSB dwc2 handler.
 static void bridge_otg_irq(void) {
   NVIC_DisableIRQ(OTG_HS_IRQn);
@@ -170,11 +204,17 @@ int main(void) {
   // (no host to power-cycle a hung bridge over USB), arm the hardware IWDG too.
   simple_watchdog_init(FAULT_HEARTBEAT_LOOP_WATCHDOG, (3U * 1000000U / 8U));
 
+  uint32_t last_led_ms = 0U;
   while (true) {
     simple_watchdog_kick();
     tud_task_ext(0U, false);     // service USB
     bridge_net_service();        // pump lwIP timers + RX
-    bridge_can_poll(bridge_now_ms());
+    uint32_t now = bridge_now_ms();
+    bridge_can_poll(now);
+    if ((now - last_led_ms) >= 100U) {   // throttle GPIO writes to ~10 Hz
+      last_led_ms = now;
+      bridge_update_led(now);
+    }
   }
   return 0;
 }

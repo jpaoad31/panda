@@ -134,3 +134,20 @@ void bridge_net_init(void) {
 void bridge_net_service(void) {
   sys_check_timeouts();
 }
+
+// --- status helpers for the bring-up LED (main_bridge.c) ---
+
+// USB device configured (the NCM network interface is live).
+bool bridge_net_usb_ready(void) {
+  return tud_ready();
+}
+
+// A host holds a DHCP lease: dhserver writes the client MAC into an entry on ACK,
+// so a non-zero MAC in any slot means a lease has been handed out.
+bool bridge_net_has_dhcp_lease(void) {
+  for (unsigned int i = 0U; i < TU_ARRAY_SIZE(entries); i++) {
+    const uint8_t *m = entries[i].mac;
+    if ((m[0] | m[1] | m[2] | m[3] | m[4] | m[5]) != 0U) { return true; }
+  }
+  return false;
+}

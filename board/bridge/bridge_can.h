@@ -31,3 +31,7 @@ void bridge_can_poll(uint32_t now_ms);
 // True once an app client has been seen and hasn't timed out — handy for a
 // status LED.
 bool bridge_can_client_connected(void);
+
+// True while real CAN frames (not just keepalives) reached the client in the last
+// ~second — the "green" state of the bring-up LED.
+bool bridge_can_frames_flowing(uint32_t now_ms);

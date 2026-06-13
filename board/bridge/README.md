@@ -108,6 +108,105 @@ How it's wired (`main_bridge.c` is the unity TU):
 - *Validate in order:* NCM enumerates on iPad → DHCP lease → app Connected → CAN
   flows. The clock/PHY/GPIO bring-up is the part that "links but may not enumerate."
 
+## Flashing
+
+The build emits two artifacts under `board/obj/`: `panda_bridge.bin.signed` (our app)
+and `bootstub.panda_h7.bin` (the stock **debug** bootstub, from the `panda_h7` target).
+
+```bash
+board/bridge/vendor.sh        # one-time: vendor TinyUSB/lwIP
+board/bridge/macos_build.sh   # builds all targets incl. the signed bridge app
+```
+
+1. **Install a debug bootstub (one-time, only if the panda has a release/factory
+   bootstub).** A release bootstub has no `-DALLOW_DEBUG`, so it rejects our
+   debug-signed app and falls into the flasher. DFU-flash the debug bootstub:
+   ```bash
+   python3 -c "from panda import Panda; Panda().recover()"
+   ```
+   `recover()` reads the hardcoded `bootstub.panda_h7.bin` (now a debug bootstub) and
+   then reflashes the stock app — that's fine, we overwrite the app in step 2. A
+   panda already running source-built firmware has a debug bootstub; skip this step.
+
+2. **Flash the bridge app:**
+   ```bash
+   python3 -c "from panda import Panda; Panda().flash('board/obj/panda_bridge.bin.signed', reconnect=False)"
+   ```
+   **`reconnect=False` is required.** After flashing, the panda reboots into the NCM
+   app, which does **not** speak the panda USB protocol — the library's default
+   reconnect would hang. From here it should enumerate as a USB-NCM network interface.
+
+### Re-flashing (escape hatch)
+
+Once the NCM app is running you **cannot force it back into the flasher over USB** the
+normal way: the app has no panda control endpoint, so the host's
+`reset(enter_bootstub=True)` (`0xd1`) request goes unanswered. The bootstub runs on
+every boot but only *stays* in the flasher if the app signature fails or the boot magic
+is set. There are no buttons / exposed BOOT0 on red, so without an escape hatch
+re-flashing would mean opening the case for SWD.
+
+**The app provides the escape hatch** (`bridge_can.c` → `main_bridge.c`
+`bridge_request_reboot`): two exact 8-byte UDP sentinels write the boot magic to
+`enter_bootloader_mode` (SRAM `0x38001FFC`, survives the soft reset) and `NVIC_SystemReset`.
+A host dev script sends them; the **iOS app never does**.
+
+```bash
+# reflash the APP (next boot enters the bootstub soft-flasher):
+python3 -c "import socket; socket.socket(2,2).sendto(b'RSDFUAPP', ('192.168.4.1',5555))"
+python3 -c "from panda import Panda; Panda().flash('board/obj/panda_bridge.bin.signed', reconnect=False)"
+
+# reflash the BOOTSTUB too (next boot enters ST ROM DFU):
+python3 -c "import socket; socket.socket(2,2).sendto(b'RSDFUBTL', ('192.168.4.1',5555))"
+python3 -c "from panda import Panda; Panda().recover()"
+```
+
+The sentinels can't collide with a ≤1-byte heartbeat or a checksum-valid CAN frame, so
+the match is unambiguous.
+
+#### Belt-and-suspenders: the dev bootstub (`bootstub.panda_bridge.bin`)
+
+The UDP sentinel only works once the app reaches its UDP loop. If a build wedges
+*before* that (a hang in early init / `tud_task`), the sentinel can't help — and red
+has no button/BOOT0. For that case the build also produces a **dev bootstub** that
+opens a flash window on **every** boot, so any app, however broken, is always
+recoverable over plain USB.
+
+Behaviour (`-DBRIDGE_DEV_FLASH_WINDOW`, in `bootstub.c` + `flasher.h`): each boot it
+enumerates as the panda flasher for ~3 s (blue LED blinking). If a host starts flashing
+in that window it stays in the flasher; otherwise it resets straight into the app (a
+skip flag in SRAM avoids re-opening the window). Cost: ~3 s added boot time + a brief
+flasher→NCM re-enumerate — dev-only. The stock `bootstub.panda_h7.bin` is unflagged and
+unaffected.
+
+Install it once via DFU (`recover()` is hardcoded to `bootstub.panda_h7.bin`, so use
+`PandaDFU` directly):
+```python
+from panda import Panda, PandaDFU
+import time
+p = Panda(); p.reset(enter_bootstub=True); p.reset(enter_bootloader=True)  # -> ST ROM DFU
+time.sleep(1)
+d = PandaDFU(PandaDFU.list()[0])
+d.program_bootstub(open("board/obj/bootstub.panda_bridge.bin", "rb").read())
+d.reset()
+```
+Then re-flash the app any time by power-cycling and running `Panda().flash(...)` within
+the window. Miss the window and it just boots the (old) app — power-cycle and retry; a
+bad app can never block the next boot's window.
+
+### Status LED (red panda, GPIOE 4/3/2)
+
+`main_bridge.c` drives the RGB LED as a worst-state-wins bring-up ladder (mirrors the
+Pico bridge), so a sealed box is debuggable at a glance — invaluable since USB is busy
+being NCM:
+
+| Color | Meaning |
+|-------|---------|
+| white | USB/NCM not up yet (booting) |
+| cyan | NCM up, host has **no DHCP lease** (the flaky-bring-up tell) |
+| blue | host leased, **app not connected** |
+| purple | app connected, **no CAN frames** (check car wiring / harness) |
+| green | healthy — app connected + CAN flowing |
+
 ## Remaining work (on the panda)
 
 The build/link, SCons target, glue, and init wiring are **done** (see Status above).
@@ -115,8 +214,8 @@ What's left needs the device:
 
 1. **Smoke test (path A as-is).** Flash, plug into iPad: does it enumerate as NCM →
    get a 192.168.4.x DHCP lease → app shows Connected (UDP keepalive) → CAN frames
-   appear? Fastest yes/no. A status LED mirroring the Pico's
-   cyan→blue→purple→green ladder makes bring-up much easier.
+   appear? Fastest yes/no. The RGB status LED (see "Status LED" above) shows exactly
+   where bring-up stalls — watch it walk white→cyan→blue→purple→green.
 
 2. **Refactor `main_bridge.c` to a MINIMAL init (the cleanup).** Today it includes
    the full panda header set and calls `current_board->init()` so everything links,
@@ -145,8 +244,12 @@ What's left needs the device:
 
 4. **Trim lwIP bss** (~455 KB): tune `lwipopts.h` pool sizes / `LWIP_HIGH_THROUGHPUT`.
 
-5. **Bootstub + signing.** The target builds `main.{elf,bin}` only; add the bootstub
-   build + `sign.py` step (mirror `build_project`) before it can actually boot.
+5. **Bootstub + signing — DONE.** The target now signs the app (`SETLEN=1 sign.py`,
+   mirroring `build_project`) and emits `board/obj/panda_bridge.bin.signed`
+   (`[len][app][VERS+version][1024-bit RSA sig]`, debug key in a source build). No
+   bridge-specific bootstub is built: the bootstub is app-agnostic (it only
+   sig-checks then jumps to `0x8020000`), so the stock debug `bootstub.panda_h7.bin`
+   runs the signed image. See "Flashing" below.
 
 ## Safety mode
 

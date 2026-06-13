@@ -148,3 +148,43 @@ void soft_flasher_start(void) {
     delay(500000);
   }
 }
+
+#ifdef BRIDGE_DEV_FLASH_WINDOW
+// Dev-only (see board/bridge/README.md): open the soft-flasher for a brief window on
+// every boot so a wedged RoadStud NCM app is always recoverable over USB — the red
+// panda has no button / exposed BOOT0. Brings up the same flasher USB as
+// soft_flasher_start(); if a host begins flashing (0xb1 unlock) within the window we
+// stay in the flasher forever, otherwise we return so the caller can reset into the app.
+void soft_flasher_window(void) {
+  enter_bootloader_mode = 0;
+
+  flasher_peripherals_init();
+  gpio_usart2_init();
+  gpio_usb_init();
+  led_init();
+  usb_init();
+  if (current_board->has_spi) {
+    gpio_spi_init();
+    spi_init();
+  }
+  enable_interrupts();
+
+  // ~3 s window; blue LED blinks = "flash window open".
+  for (uint32_t i = 0U; i < 60U; i++) {
+    if (unlocked) {
+      // a host started flashing — from here behave exactly like soft_flasher_start().
+      for (;;) {
+        led_set(LED_GREEN, 0);
+        delay(500000);
+        led_set(LED_GREEN, 1);
+        delay(500000);
+      }
+    }
+    led_set(LED_BLUE, (i % 10U) < 5U);
+    delay(50000);
+  }
+
+  led_set(LED_BLUE, 0);
+  disable_interrupts();
+}
+#endif

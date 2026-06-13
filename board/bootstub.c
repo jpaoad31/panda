@@ -47,6 +47,22 @@ int main(void) {
     soft_flasher_start();
   }
 
+#ifdef BRIDGE_DEV_FLASH_WINDOW
+  // RoadStud dev bootstub: on every boot, offer a flash window before launching the
+  // app, so a wedged NCM app is always recoverable over USB (see board/bridge/README.md).
+  // The skip flag lives in SRAM (survives the soft reset) so the post-window boot goes
+  // straight to the app on a fresh USB peripheral instead of re-opening the window.
+  #define BRIDGE_BOOT_SKIP       (*(volatile uint32_t *)0x38001FF8U)
+  #define BRIDGE_BOOT_SKIP_MAGIC 0x50494B53U   // 'SKIP'
+  if (BRIDGE_BOOT_SKIP == BRIDGE_BOOT_SKIP_MAGIC) {
+    BRIDGE_BOOT_SKIP = 0U;               // consume: this boot launches the app
+  } else {
+    soft_flasher_window();               // returns only if no host flashed in the window
+    BRIDGE_BOOT_SKIP = BRIDGE_BOOT_SKIP_MAGIC;
+    NVIC_SystemReset();                  // clean reboot -> app comes up on a fresh USB
+  }
+#endif
+
   // validate length
   int len = (int)_app_start[0];
   if ((len < 8) || (len > (0x1000000 - 0x4000 - 4 - RSANUMBYTES))) goto fail;

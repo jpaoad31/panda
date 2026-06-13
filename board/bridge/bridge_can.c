@@ -31,6 +31,12 @@ extern can_ring can_rx_q;
 bool can_pop(can_ring *q, CANPacket_t *elem);
 void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook);
 
+// Provided by main_bridge.c: set the bootstub re-entry magic + reset. The NCM app
+// has no panda control endpoint, so a host can't request enter-bootstub the usual
+// way; a magic UDP datagram (below) is the escape hatch instead.
+//   dfu=false -> soft-flasher (reflash the app);  dfu=true -> ST ROM DFU (reflash the bootstub).
+extern void bridge_request_reboot(bool dfu);
+
 #define BRIDGE_UDP_PORT       5555U
 #define HEARTBEAT_TIMEOUT_MS  500U
 #define KEEPALIVE_INTERVAL_MS 250U
@@ -41,6 +47,7 @@ static uint16_t   client_port;
 static bool       client_connected;
 static uint32_t   last_client_packet_ms;
 static uint32_t   last_send_ms;
+static uint32_t   last_can_frame_ms;   // last real CAN frame -> client (not a keepalive)
 // Updated at the top of every bridge_can_poll(); read by the lwIP receive
 // callback (which fires within the same NO_SYS poll loop) so it can timestamp
 // client activity without plumbing now_ms through lwIP.
@@ -70,11 +77,27 @@ static void send_keepalive(void) {
   pbuf_free(p);
 }
 
+// Exact 8-byte re-flash sentinel match. Can't collide with a <=1-byte heartbeat,
+// and no checksum-valid CAN frame can equal these bytes, so the match is unambiguous.
+static bool sentinel_is(const struct pbuf *p, const char *tag) {
+  if (p->tot_len != 8U) { return false; }
+  const uint8_t *d = (const uint8_t *)p->payload;
+  for (uint8_t i = 0U; i < 8U; i++) {
+    if (d[i] != (uint8_t)tag[i]) { return false; }
+  }
+  return true;
+}
+
 // app -> car: parse concatenated bridge packets and write each to the bus.
 static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                         const ip_addr_t *addr, u16_t port) {
   (void)arg; (void)pcb;
   if (p == NULL) { return; }
+
+  // Re-flash escape hatch (see README "Re-flashing gotcha"): a host dev script sends
+  // these; the iOS app never does. bridge_request_reboot() does not return.
+  if (sentinel_is(p, "RSDFUAPP")) { pbuf_free(p); bridge_request_reboot(false); return; }
+  if (sentinel_is(p, "RSDFUBTL")) { pbuf_free(p); bridge_request_reboot(true);  return; }
 
   ip_addr_copy(client_addr, *addr);
   client_port = port;
@@ -111,6 +134,11 @@ bool bridge_can_client_connected(void) {
   return client_connected;
 }
 
+// True while real CAN frames (not just keepalives) reached the client recently.
+bool bridge_can_frames_flowing(uint32_t now_ms) {
+  return client_connected && (last_can_frame_ms != 0U) && ((now_ms - last_can_frame_ms) < 1000U);
+}
+
 void bridge_can_poll(uint32_t now_ms) {
   current_ms = now_ms;   // visible to udp_recv_cb (same NO_SYS loop)
 
@@ -134,6 +162,7 @@ void bridge_can_poll(uint32_t now_ms) {
     if (tx_buf_len > 0) {
       flush_tx_buffer();
       last_send_ms = now_ms;
+      last_can_frame_ms = now_ms;
     } else if ((now_ms - last_send_ms) > KEEPALIVE_INTERVAL_MS) {
       send_keepalive();
       last_send_ms = now_ms;
