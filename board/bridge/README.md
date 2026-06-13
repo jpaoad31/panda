@@ -99,13 +99,22 @@ takes `--reflash` / `--reflash-bootstub` to fire the escape-hatch sentinels.
 | `lwipopts.h` | ✅ staged (from 0.20 example) | lwIP NO_SYS config, version-matched. |
 | `arch/` | ✅ staged (from 0.20 example) | lwIP `cc.h` / `bpstruct.h` / `epstruct.h`. |
 | `usb_descriptors.ncm.reference.c` | 📋 reference | The 0.20 example's net descriptors — trim to NCM-only for the final `usb_descriptors.c`. |
-| `main_bridge.c` | 🟨 template | Shows how it all assembles. `[COPY]` = copy from the example; `[PANDA]` = adapt to this fork. |
+| `main_bridge.c` | ✅ done + **validated on hardware** | Unity TU: panda init + OTG→TinyUSB IRQ routing + the bridge main loop (status LED ladder + re-flash escape hatch). |
 
 Tooling + sources are confirmed lined up: TinyUSB 0.20 (NCM + dwc2 STM32H7) and lwIP
 2.2 are cloned at `~/github/tinyusb` + `~/github/lwip`; the macOS build env builds the
 stock `panda_h7` firmware; and the bridge logic compiles against the pinned headers.
 
-## Status: COMPILES + LINKS (unvalidated — no hardware yet)
+## Status: VALIDATED ON HARDWARE (2026-06-12)
+
+A **red panda** flashed with this firmware was driven end-to-end from a Linux host
+(Raspberry Pi): it enumerated as USB-CDC-NCM, brought up lwIP, leased the host
+`192.168.4.2` from its DHCP server, and streamed **~1800 CAN frames/s across 29 unique
+IDs** over the panda-bridge UDP protocol — verified with `board/bridge/tools/bridge_test.py`
+(the host standing in for the iPhone). NCM + lwIP + DHCP + FDCAN read + the signing/boot
+chain all work. (A USB-C-only Mac could **not** enumerate the panda — its USB-A device
+port needs a real USB-A host; a Pi or USB-A machine is the reliable host, see the Pi
+build section above.)
 
 `board/obj/panda_bridge/main.{elf,bin}` builds end-to-end (text ~94 KB, data ~23 KB,
 bss ~455 KB — fits the H7 RAM regions). Build it:
@@ -125,7 +134,7 @@ How it's wired (`main_bridge.c` is the unity TU):
   `atoi`/`strcmp`/`strcpy`), a dummy `_ctype_` (lwIP IP-string parsing is unused),
   and `SystemCoreClock = 240 MHz` (for dwc2 timing).
 
-**Caveats to resolve on hardware (it links, but isn't proven to run):**
+**Production follow-ups (it runs end-to-end; these harden it):**
 - *Path-A coupling:* to make `current_board->init()` link, `main_bridge.c` includes
   the full panda driver/comms/USB header set, so the panda USB class is compiled but
   **dormant** (we never call `usb_init()`; only TinyUSB drives OTG). For production,
@@ -237,13 +246,14 @@ being NCM:
 
 ## Remaining work (on the panda)
 
-The build/link, SCons target, glue, and init wiring are **done** (see Status above).
-What's left needs the device:
+The build/link, SCons target, glue, init wiring, and a full hardware bring-up are
+**done** (see Status above). What's left:
 
-1. **Smoke test (path A as-is).** Flash, plug into iPad: does it enumerate as NCM →
-   get a 192.168.4.x DHCP lease → app shows Connected (UDP keepalive) → CAN frames
-   appear? Fastest yes/no. The RGB status LED (see "Status LED" above) shows exactly
-   where bring-up stalls — watch it walk white→cyan→blue→purple→green.
+1. ~~**Smoke test (path A as-is).**~~ ✅ **DONE (2026-06-12)** — flashed a red panda;
+   enumerated as NCM → host got a 192.168.4.x DHCP lease → ~1800 CAN frames/s across 29
+   IDs over UDP. Verified from a Linux host (`bridge_test.py`); the iPhone/iPad is the
+   next host to try (should behave identically). The RGB status LED ladder
+   (white→cyan→blue→purple→green) made bring-up debuggable at a glance.
 
 2. **Refactor `main_bridge.c` to a MINIMAL init (the cleanup).** Today it includes
    the full panda header set and calls `current_board->init()` so everything links,

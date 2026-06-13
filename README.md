@@ -2,6 +2,22 @@
 
 panda speaks CAN and CAN FD, and it runs on the [STM32H725](https://www.st.com/resource/en/reference_manual/rm0468-stm32h723733-stm32h725735-and-stm32h730-value-line-advanced-armbased-32bit-mcus-stmicroelectronics.pdf).
 
+## Fork: RoadStud USB-NCM bridge
+
+This is a fork of comma's panda with one addition: a dedicated **USB-CDC-NCM firmware**
+(`board/bridge/`) that turns a panda into a direct USB-C CAN interface for the
+**RoadStud** iOS driver-assistance app — no Pico/WiFi bridge in between. The panda
+enumerates as a USB Ethernet device, runs a small lwIP/DHCP stack, and streams CAN over
+UDP (the panda packet format) to `192.168.4.1:5555`, so the app connects unchanged.
+
+**Status: validated on hardware** — a red panda flashed with this firmware streams live
+CAN (~1800 frames/s, 29 IDs) to a host over USB-NCM. Build, flash (incl. a recoverable
+dev bootstub with a boot-time flash window), and comms-test tooling are documented in
+**[`board/bridge/README.md`](board/bridge/README.md)**.
+
+Everything else is stock panda — the safety model and standard firmware are unchanged;
+the bridge is a separate, optional build target.
+
 ## Directory structure
 
 ```
