@@ -8,12 +8,18 @@ This is a fork of comma's panda with one addition: a dedicated **USB-CDC-NCM fir
 (`board/bridge/`) that turns a panda into a direct USB-C CAN interface for the
 **RoadStud** iOS driver-assistance app — no Pico/WiFi bridge in between. The panda
 enumerates as a USB Ethernet device, runs a small lwIP/DHCP stack, and streams CAN over
-UDP (the panda packet format) to `192.168.4.1:5555`, so the app connects unchanged.
+UDP (the panda packet format) to `192.168.4.1:5555`, so the app connects unchanged. It
+also tunnels the panda's **native control transfers** over the same socket (an "RSCP"
+request/response routed through `comms_control_handler`), so the host gets the full
+control surface — health, set-safety-mode, heartbeat, CAN speed, OBD mux — that the
+proprietary USB driver exposed, including actuation (a 1 Hz safety/heartbeat tick gates
+controls just like stock).
 
 **Status: validated on hardware** — a red panda flashed with this firmware streams live
-CAN (~1800 frames/s, 29 IDs) to a host over USB-NCM. Build, flash (incl. a recoverable
-dev bootstub with a boot-time flash window), and comms-test tooling are documented in
-**[`board/bridge/README.md`](board/bridge/README.md)**.
+CAN (read a Hyundai over OBD, ~9k frames/s across 29 IDs) to a host over USB-NCM, and
+the RSCP control plane (health round-trip, safety-mode + heartbeat gating) is validated.
+Build, flash (incl. a recoverable dev bootstub with a boot-time flash window), and
+comms-test tooling are documented in **[`board/bridge/README.md`](board/bridge/README.md)**.
 
 Everything else is stock panda — the safety model and standard firmware are unchanged;
 the bridge is a separate, optional build target.

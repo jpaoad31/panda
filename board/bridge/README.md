@@ -4,9 +4,10 @@ Make a comma **panda** connect **directly** to an iPhone/iPad over USB-C and fee
 the RoadStud app CAN data — no Pico, no WiFi/Pi (too much latency), no extra
 USB-to-CAN adapter. The app connects **unchanged**.
 
-This is a **scaffold**: the hardware-independent logic is written and correct;
-the USB/lwIP/build assembly is documented and must be brought up against real
-hardware following the methodology below.
+**Validated on hardware** (see Status below): NCM + lwIP + DHCP + FDCAN + the
+signing/boot chain all work, and the app reads a real car over the bridge. Beyond raw
+CAN, the bridge also tunnels the panda's full native control surface over the same UDP
+socket — see "Control plane (RSCP)".
 
 ## Why this is mostly firmware, not hardware
 
@@ -99,7 +100,7 @@ takes `--reflash` / `--reflash-bootstub` to fire the escape-hatch sentinels.
 | `lwipopts.h` | ✅ staged (from 0.20 example) | lwIP NO_SYS config, version-matched. |
 | `arch/` | ✅ staged (from 0.20 example) | lwIP `cc.h` / `bpstruct.h` / `epstruct.h`. |
 | `usb_descriptors.ncm.reference.c` | 📋 reference | The 0.20 example's net descriptors — trim to NCM-only for the final `usb_descriptors.c`. |
-| `main_bridge.c` | ✅ done + **validated on hardware** | Unity TU: panda init + OTG→TinyUSB IRQ routing + the bridge main loop (status LED ladder + re-flash escape hatch). |
+| `main_bridge.c` | ✅ done + **validated on hardware** | Unity TU: panda init (boot `SAFETY_NOOUTPUT`) + OTG→TinyUSB IRQ routing + the bridge main loop (status LED ladder, re-flash escape hatch, 1 Hz safety/heartbeat tick for actuation). |
 
 Tooling + sources are confirmed lined up: TinyUSB 0.20 (NCM + dwc2 STM32H7) and lwIP
 2.2 are cloned at `~/github/tinyusb` + `~/github/lwip`; the macOS build env builds the
@@ -265,8 +266,10 @@ The build/link, SCons target, glue, init wiring, and a full hardware bring-up ar
      `peripherals.h`) — **not** the full `current_board->init()`,
    - FDCAN GPIO AF + `can_init_all()`,
    - `microsecond_timer_init()`,
-   - drop `board/drivers/usb.h`, `can_comms.h`, `main_comms.h`, `pwm.h`, `bootkick.h`
-     and the copied `set_safety_mode`/`is_car_safety_mode`.
+   - drop `board/drivers/usb.h`, `pwm.h`, `bootkick.h` — but **keep** `can_comms.h`,
+     `main_comms.h`, and the copied `set_safety_mode`/`is_car_safety_mode`: the RSCP
+     control plane routes through `comms_control_handler` and actuation needs
+     `set_safety_mode`, so they're now load-bearing, not dead weight.
    Payoff: no stray IRQs/peripherals running unserviced, no second USB stack in the
    image, smaller/debuggable firmware. It's the production shape, not needed just to
    *try* enumeration.
@@ -289,13 +292,48 @@ The build/link, SCons target, glue, init wiring, and a full hardware bring-up ar
    sig-checks then jumps to `0x8020000`), so the stock debug `bootstub.panda_h7.bin`
    runs the signed image. See "Flashing" below.
 
-## Safety mode
+## Control plane (RSCP)
 
-`bridge_can.c` injects app→car frames via `can_send(&pkt, pkt.bus, /*skip_tx_hook=*/false)`,
-so the panda safety model applies. For RoadStud's read-only use that's irrelevant
-(the app sends nothing but heartbeats). When actuation is enabled, set an
-appropriate safety mode, or pass `skip_tx_hook=true` for a raw forwarding bridge —
-decide deliberately; this is the gate between the app and the car's actuators.
+Beyond streaming CAN, the bridge tunnels the panda's **native control transfers** over
+the same UDP socket, so the app reaches everything the proprietary USB driver did
+(health, version, serial, set-safety-mode, heartbeat, CAN speed, OBD mux). Rather than
+reimplement each command, a request is marshalled into a `ControlPacket_t` and run
+through the panda's own `comms_control_handler` — full parity for one dispatch shim.
+
+Wire format (shares `:5555` with CAN frames, the keepalive, and the reflash sentinels):
+- request `"RSCP"`: `[0..3]`magic `[4]`ver=1 `[5]`opcode(bRequest) `[6]`req_id `[7]`flags `[8..9]`param1(LE) `[10..11]`param2(LE) `[12..13]`resp_cap(LE) `[14..]`payload
+- response `"RSCR"`: `[0..3]`magic `[4]`ver `[5]`opcode `[6]`req_id `[7]`status `[8..9]`payload_len(LE) `[10..]`payload
+
+- Requests are recognised in the lwIP receive callback but **deferred to the main loop**
+  (`process_control`) before calling the handler, since some commands re-init CAN.
+- Disambiguation vs a CAN batch: the magic must match **and** byte[5] must not be a
+  valid CAN XOR checksum (an opcode is ≥0xA8, never the 0x13 checksum of `"RSCP"`+ver).
+- **Retransmit dedupe:** the last reply is cached and a retransmit (same `req_id`) is
+  re-ACKed without re-running the handler, so non-idempotent OUT commands run once.
+
+### OBD vs NORMAL routing (which bus a car is read on)
+
+The panda only exposes the **OBD-II port** CAN on **bus 1** in OBD mode (`set_obd`,
+`CAN_MODE_OBD_CAN2`). In NORMAL mode it reads the harness powertrain (bus 0) + camera
+(bus 2) and the OBD-II pins are **not** muxed — so an OBD-tapped car reads **0 frames**
+in NORMAL mode (electrically silent, no bus errors — the giveaway it's a routing issue,
+not a bitrate one). The app enables OBD on connect and settles it per-car from the
+openpilot `CanBus` (`needsOBD = canBus.all.contains(1)`).
+
+## Safety mode + actuation heartbeat
+
+Boot initialises via `set_safety_mode(SAFETY_NOOUTPUT)`: CAN receives + ACKs normally,
+but all TX is gated by the safety model (read-only by default). `bridge_can.c` injects
+app→car frames via `can_send(..., skip_tx_hook=false)`, so the panda safety model is the
+gate between the app and the car's actuators.
+
+For actuation the app sends `set_safety_mode` (0xDC) for the car + a **2 Hz heartbeat**
+(0xF3). `main_bridge.c`'s `bridge_safety_tick()` ports the safety-relevant subset of the
+stock 1 Hz tick (heartbeat counter, controls-allowed bookkeeping, the 3-strike engaged
+mismatch, `safety_tick`) and **reverts to SILENT if the heartbeat lapses** — but only in
+a car safety mode, so the read-only NOOUTPUT state is never forced to SILENT. Validated
+on hardware: the mode round-trips, reverts on heartbeat loss, and holds with the 2 Hz
+heartbeat flowing.
 
 ## What the app needs (unchanged) — acceptance checklist
 
