@@ -169,8 +169,8 @@ void soft_flasher_window(void) {
   }
   enable_interrupts();
 
-  // ~3 s window; blue LED blinks = "flash window open".
-  for (uint32_t i = 0U; i < 60U; i++) {
+  // ~15 s window; blue LED blinks = "flash window open".
+  for (uint32_t i = 0U; i < 300U; i++) {
     if (unlocked) {
       // a host started flashing — from here behave exactly like soft_flasher_start().
       for (;;) {

@@ -61,6 +61,34 @@ Two macOS gotchas the script handles (the stock docs miss these):
   first on `PATH` or it uses system python3 (no `pycryptodome`) and fails with
   `ModuleNotFoundError: No module named 'Crypto'`. The script puts `.venv/bin` first.
 
+## Building & flashing on a Raspberry Pi (Linux) — VERIFIED
+
+A Pi is the easiest *host* for flashing: native USB-A host ports + the documented
+Linux path (a USB-C-only Mac fights the panda's USB-A device port over cable/role
+negotiation). `board/bridge/tools/pi_build.sh` builds there; same `sign.py` PATH
+trick as macOS. One-time setup:
+
+```bash
+sudo apt install -y gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi dfu-util
+python3 -m venv ~/pandaenv
+~/pandaenv/bin/pip install scons pycryptodome numpy pycapnp   # pycapnp: opendbc CarParams
+git clone --depth 1 https://github.com/commaai/opendbc ~/opendbc
+# panda udev rules (VIDs 0483/3801/bbaa) -> /etc/udev/rules.d/11-panda.rules
+```
+
+Build, then flash (panda powered from the car, USB-A into a Pi USB-A port):
+```bash
+board/bridge/tools/pi_build.sh board/obj/panda_bridge.bin.signed board/obj/bootstub.panda_bridge.bin
+~/pandaenv/bin/python board/bridge/tools/flash_bootstub.py   # once: dev bootstub via DFU
+~/pandaenv/bin/python board/bridge/tools/flash_app.py        # flash the signed NCM app
+~/pandaenv/bin/python board/bridge/tools/bridge_test.py      # comms test: Pi acts as the app
+```
+
+`bridge_test.py` makes the Pi play the iPhone — it gets a 192.168.4.x DHCP lease over
+the NCM link, speaks the panda-bridge UDP protocol to `192.168.4.1:5555`, and prints
+CAN throughput + unique IDs (so we can confirm the bridge works without iOS). It also
+takes `--reflash` / `--reflash-bootstub` to fire the escape-hatch sentinels.
+
 ## Files in this directory
 
 | File | Status | Role |
@@ -172,9 +200,9 @@ opens a flash window on **every** boot, so any app, however broken, is always
 recoverable over plain USB.
 
 Behaviour (`-DBRIDGE_DEV_FLASH_WINDOW`, in `bootstub.c` + `flasher.h`): each boot it
-enumerates as the panda flasher for ~3 s (blue LED blinking). If a host starts flashing
+enumerates as the panda flasher for ~15 s (blue LED blinking). If a host starts flashing
 in that window it stays in the flasher; otherwise it resets straight into the app (a
-skip flag in SRAM avoids re-opening the window). Cost: ~3 s added boot time + a brief
+skip flag in SRAM avoids re-opening the window). Cost: ~15 s added boot time + a brief
 flasher→NCM re-enumerate — dev-only. The stock `bootstub.panda_h7.bin` is unflagged and
 unaffected.
 
