@@ -22,6 +22,11 @@
 #include "opendbc/safety/can.h"
 #include "board/bridge/bridge_protocol.h"
 
+// ControlPacket_t + comms_control_handler (the panda's full USB control surface).
+// The handler is defined in the unity TU (main_bridge.c includes main_comms.h);
+// here we only need the declaration. No CMSIS deps.
+#include "board/comms_definitions.h"
+
 // can_ring is panda-internal (board/drivers/drivers.h) and drags in CMSIS-typed
 // driver decls. We only ever pass &can_rx_q to can_pop and never touch its fields,
 // so an opaque forward declaration keeps those heavy headers out of this TU. The
@@ -55,6 +60,28 @@ static uint32_t   current_ms;
 
 static uint8_t tx_buf[BRIDGE_MAX_FRAMES_PER_UDP * BRIDGE_MAX_PACKET];
 static int     tx_buf_len;
+
+// --- RSCP control channel (RoadStud Control Protocol) ------------------------
+// Tunnels the panda's native USB control transfers over UDP, so the app can reach
+// the full comms_control_handler surface (health, version, safety mode, CAN speed,
+// ...) the proprietary USB driver exposed. The request is recognised in the lwIP
+// receive callback but DEFERRED to bridge_can_poll (main-loop context) before
+// calling the handler — some requests re-init CAN / touch the safety hooks (e.g.
+// set_safety_mode), which must not run from the lwIP/USB callback context. A single
+// pending slot is enough: control traffic is low-rate and the app retransmits, so
+// dropping an unprocessed older request is harmless.
+//
+//   request  "RSCP": [0..3]magic [4]ver=1 [5]opcode(bRequest) [6]req_id [7]flags
+//                    [8..9]param1(LE) [10..11]param2(LE) [12..13]resp_cap(LE) [14..]payload
+//   response "RSCR": [0..3]magic [4]ver  [5]opcode(echo) [6]req_id(echo) [7]status
+//                    [8..9]payload_len(LE) [10..]payload (handler resp bytes)
+#define RSCP_HDR_LEN 14U
+#define RSCR_HDR_LEN 10U
+#define RSCP_VERSION 1U
+
+static bool            ctrl_pending;
+static ControlPacket_t ctrl_req;
+static uint8_t         ctrl_req_id;
 
 static void flush_tx_buffer(void) {
   if ((tx_buf_len == 0) || !client_connected) { return; }
@@ -104,6 +131,26 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
   client_connected = true;
   last_client_packet_ms = current_ms;
 
+  // RSCP control request: stash it and let bridge_can_poll run the handler in
+  // main-loop context (see the RSCP block above). Can't collide with a CAN batch:
+  // a real frame's byte[5] is an XOR checksum, never the 'P' of the magic at that
+  // offset for a "RSCP"-led datagram, and we match the 4-byte magic explicitly.
+  {
+    const uint8_t *d = (const uint8_t *)p->payload;
+    if ((p->tot_len >= RSCP_HDR_LEN) &&
+        (d[0] == (uint8_t)'R') && (d[1] == (uint8_t)'S') &&
+        (d[2] == (uint8_t)'C') && (d[3] == (uint8_t)'P')) {
+      ctrl_req.request = d[5];
+      ctrl_req.param1  = (uint16_t)((uint16_t)d[8]  | ((uint16_t)d[9]  << 8));
+      ctrl_req.param2  = (uint16_t)((uint16_t)d[10] | ((uint16_t)d[11] << 8));
+      ctrl_req.length  = (uint16_t)((uint16_t)d[12] | ((uint16_t)d[13] << 8));
+      ctrl_req_id  = d[6];
+      ctrl_pending = true;
+      pbuf_free(p);
+      return;
+    }
+  }
+
   if (p->tot_len > 1) {
     const uint8_t *data = (const uint8_t *)p->payload;
     int remaining = (int)p->tot_len;
@@ -119,6 +166,35 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
       offset += consumed;
     }
   }
+  pbuf_free(p);
+}
+
+// Run a deferred RSCP request through the panda comms handler and reply with RSCR.
+// Called from bridge_can_poll (main-loop context). resp[64] covers every Phase-1
+// read: health_t is 59 B, can_health_t is 64 B, version/serial are smaller; the
+// panda EP0 path uses the same 64-byte (USBPACKET_MAX_SIZE) response buffer.
+static void process_control(void) {
+  if (!ctrl_pending) { return; }
+  ctrl_pending = false;
+
+  uint8_t resp[64];
+  if (ctrl_req.length > (uint16_t)sizeof(resp)) { ctrl_req.length = (uint16_t)sizeof(resp); }
+  int rlen = comms_control_handler(&ctrl_req, resp);   // may not return (reset/DFU opcodes)
+  uint16_t plen = (rlen > 0) ? (uint16_t)rlen : 0U;
+
+  if (!client_connected) { return; }
+  struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)(RSCR_HDR_LEN + plen), PBUF_RAM);
+  if (p == NULL) { return; }
+  uint8_t *o = (uint8_t *)p->payload;
+  o[0] = (uint8_t)'R'; o[1] = (uint8_t)'S'; o[2] = (uint8_t)'C'; o[3] = (uint8_t)'R';
+  o[4] = RSCP_VERSION;
+  o[5] = ctrl_req.request;
+  o[6] = ctrl_req_id;
+  o[7] = 0U;                          // status: reserved (handler has no error channel)
+  o[8] = (uint8_t)(plen & 0xFFU);
+  o[9] = (uint8_t)(plen >> 8);
+  if (plen > 0U) { memcpy(&o[RSCR_HDR_LEN], resp, plen); }
+  udp_sendto(can_udp, p, &client_addr, client_port);
   pbuf_free(p);
 }
 
@@ -141,6 +217,8 @@ bool bridge_can_frames_flowing(uint32_t now_ms) {
 
 void bridge_can_poll(uint32_t now_ms) {
   current_ms = now_ms;   // visible to udp_recv_cb (same NO_SYS loop)
+
+  process_control();     // run any RSCP request the lwIP callback deferred
 
   // Drop the client after silence.
   if (client_connected && ((now_ms - last_client_packet_ms) > HEARTBEAT_TIMEOUT_MS)) {
