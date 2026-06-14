@@ -91,6 +91,9 @@ static uint8_t  last_done_reqid;
 static uint16_t cached_resp_len;
 static uint8_t  cached_resp[RSCR_HDR_LEN + 64];
 
+// Periodic unsolicited health push throttle (see bridge_send_health).
+static uint32_t last_health_ms;
+
 static void flush_tx_buffer(void) {
   if ((tx_buf_len == 0) || !client_connected) { return; }
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)tx_buf_len, PBUF_RAM);
@@ -228,6 +231,40 @@ static void process_control(void) {
   send_to_client(cached_resp, cached_resp_len);
 }
 
+// Periodic unsolicited health push (~2 Hz): an RSCR with req_id=0. The app never uses
+// req_id 0, so it routes this to its health cache instead of matching a pending
+// request — no new magic, reuses the RSCR framing + isControlResponse check. Serialised
+// through the same comms_control_handler as the 0xD2 request path, but kept ENTIRELY
+// separate from the request/retransmit cache (local buffers) so it can't be mistaken
+// for, or clobber, a real reply.
+static void bridge_send_health(uint32_t now_ms) {
+  if (!client_connected) { return; }
+  if ((now_ms - last_health_ms) < 500U) { return; }   // ~2 Hz
+  last_health_ms = now_ms;
+
+  ControlPacket_t pkt;
+  pkt.request = 0xD2U;   // health_read
+  pkt.param1 = 0U;
+  pkt.param2 = 0U;
+  pkt.length = 64U;
+  uint8_t resp[64];
+  int rlen = comms_control_handler(&pkt, resp);
+  if (rlen <= 0) { return; }
+  uint16_t plen = (uint16_t)rlen;
+  if (plen > (uint16_t)sizeof(resp)) { plen = (uint16_t)sizeof(resp); }
+
+  uint8_t out[RSCR_HDR_LEN + 64];
+  out[0] = (uint8_t)'R'; out[1] = (uint8_t)'S'; out[2] = (uint8_t)'C'; out[3] = (uint8_t)'R';
+  out[4] = RSCP_VERSION;
+  out[5] = 0xD2U;        // opcode echo
+  out[6] = 0U;           // req_id = 0 -> unsolicited push
+  out[7] = 0U;           // status: ok
+  out[8] = (uint8_t)(plen & 0xFFU);
+  out[9] = (uint8_t)(plen >> 8);
+  memcpy(&out[RSCR_HDR_LEN], resp, plen);
+  send_to_client(out, (uint16_t)(RSCR_HDR_LEN + plen));
+}
+
 void bridge_can_init(void) {
   can_udp = udp_new();
   udp_bind(can_udp, IP_ADDR_ANY, BRIDGE_UDP_PORT);
@@ -276,4 +313,6 @@ void bridge_can_poll(uint32_t now_ms) {
       last_send_ms = now_ms;
     }
   }
+
+  bridge_send_health(now_ms);   // unsolicited ~2 Hz health push (self-gated)
 }
