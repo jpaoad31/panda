@@ -201,6 +201,27 @@ python3 -c "from panda import Panda; Panda().recover()"
 The sentinels can't collide with a ≤1-byte heartbeat or a checksum-valid CAN frame, so
 the match is unambiguous.
 
+> **⚠️ Known issue (2026-06-14): the BOOTSTUB reflash path is unproven from the NCM app.**
+> The **app** reflash (`RSDFUAPP` → soft-flasher → `flash_app.py`) works reliably and
+> survives power-cycles. The **bootstub** reflash (`RSDFUBTL` → ST ROM DFU →
+> `flash_bootstub.py`) did **not** work on the Pi: after `RSDFUBTL`, the ST ROM DFU
+> device (`0483:df11`) never enumerated (`PandaDFU.list()` empty, `lsusb` showed
+> nothing), and the panda sat **dark — no LED, no USB** (it's in ROM DFU, which doesn't
+> drive the LEDs). **It is not bricked:** a physical **replug** power-cycles it → the dev
+> bootstub opens its flash window → boots the last-flashed app. So you can't change
+> anything *in the bootstub* (e.g. the flash-window duration — `flasher.h` is set to 5 s
+> in source but the device still runs the 15 s bootstub) until this path is fixed.
+>
+> Likely cause to investigate: the original dev bootstub was installed back when the
+> panda ran the **factory** app, which speaks the panda USB protocol, so
+> `Panda().reset(enter_bootloader=True)` could command it into ST ROM DFU directly. From
+> the NCM app the only route is `RSDFUBTL` → `ENTER_BOOTLOADER_MAGIC` →
+> `enter_bootloader()` in the bootstub — which may not bring up USB the way the STM32H7
+> ROM DFU expects (different PHY/clock setup), or needs more enumeration settle time, or
+> a different host. Confirm whether the panda actually reaches ROM DFU (vs. the dev
+> bootstub's own soft-flasher window intercepting first), then make `flash_bootstub.py`
+> find it. The app path is unaffected, so this doesn't block app firmware work.
+
 #### Belt-and-suspenders: the dev bootstub (`bootstub.panda_bridge.bin`)
 
 The UDP sentinel only works once the app reaches its UDP loop. If a build wedges
@@ -249,6 +270,11 @@ being NCM:
 
 The build/link, SCons target, glue, init wiring, and a full hardware bring-up are
 **done** (see Status above). What's left:
+
+0. **Fix the bootstub reflash path (ST ROM DFU from the NCM app).** `RSDFUBTL` →
+   `flash_bootstub.py` doesn't enumerate ST ROM DFU on the Pi — see the "Known issue"
+   callout under "Re-flashing" above. Not needed for app work (the `RSDFUAPP` app path is
+   solid), but required before any bootstub change (e.g. the 5 s flash window) can ship.
 
 1. ~~**Smoke test (path A as-is).**~~ ✅ **DONE (2026-06-12)** — flashed a red panda;
    enumerated as NCM → host got a 192.168.4.x DHCP lease → ~1800 CAN frames/s across 29
