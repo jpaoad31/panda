@@ -42,16 +42,30 @@ static const dhcp_config_t dhcp_config = {
   entries
 };
 
+// stack -> host. NON-BLOCKING by design: if the NCM TX buffer is busy, DROP this
+// datagram rather than spin. The stock TinyUSB example here was `for(;;){ ...
+// tud_task(); }`, which (1) wedges the whole main loop — and with it CAN read, the
+// lwIP timers, and ICMP — whenever the host can't drain as fast as we produce
+// (e.g. armed/relay-intercept mode roughly doubles CAN traffic via bus0<->bus2
+// forwarding), and (2) re-enters this very output path from tud_task() (incoming
+// frame -> lwIP input -> ARP/ICMP reply -> linkoutput), which NO_SYS lwIP can't do
+// safely. Our traffic is UDP (CAN batches + health pushes) and tolerates loss; the
+// main loop calls tud_task() every iteration, so the TX buffer still drains there.
+// Count of outbound datagrams dropped because the NCM TX buffer was busy (the
+// non-blocking drop below). Surfaced on the health push so the app can see how
+// often we shed under load. Monotonic since boot.
+static uint32_t tx_drop_count;
+uint32_t bridge_net_tx_drops(void) { return tx_drop_count; }
+
 static err_t linkoutput_fn(struct netif *netif, struct pbuf *p) {
   (void)netif;
-  for (;;) {
-    if (!tud_ready()) { return ERR_USE; }
-    if (tud_network_can_xmit(p->tot_len)) {
-      tud_network_xmit(p, 0);
-      return ERR_OK;
-    }
-    tud_task();
+  if (!tud_ready()) { return ERR_USE; }
+  if (!tud_network_can_xmit(p->tot_len)) {   // NCM TX busy -> drop (non-blocking)
+    tx_drop_count++;
+    return ERR_OK;
   }
+  tud_network_xmit(p, 0);
+  return ERR_OK;
 }
 
 static err_t ip4_output_fn(struct netif *netif, struct pbuf *p, const ip4_addr_t *addr) {

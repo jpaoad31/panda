@@ -337,6 +337,28 @@ Wire format (shares `:5555` with CAN frames, the keepalive, and the reflash sent
 - **Retransmit dedupe:** the last reply is cached and a retransmit (same `req_id`) is
   re-ACKed without re-running the handler, so non-idempotent OUT commands run once.
 
+### Unsolicited health push (req_id = 0) + bridge-stats trailer
+
+The bridge **pushes** an `RSCR` health datagram ~2 Hz without being asked (`bridge_send_health`),
+so the app gets continuous `safety_mode` / `controls_allowed` / voltage without polling. It's
+an ordinary `RSCR` with **`req_id = 0`** — the app never *sends* req_id 0, so it routes the
+push to its health cache instead of matching a pending request. `opcode = 0xD2`, `status = 0`.
+
+Its payload is the packed `health_t` (59 B) **plus a bridge-stats trailer** (push only — the
+on-demand `0xD2` reply via `process_control` has no trailer, `payload_len = 59`):
+
+| payload bytes | field | meaning |
+|---|---|---|
+| `[0 .. 58]` | `health_t` | packed panda health struct (`board/health.h`) — unchanged |
+| `[59 .. 62]` | `uint32 LE tx_drops` | outbound datagrams the bridge dropped on a busy NCM TX buffer, since boot |
+
+So the push has `payload_len = 63`. **App side:** an existing `health_t` parser is unaffected
+(reads `[0..58]`); to read the drop count, in the `req_id == 0` branch read `tx_drops` at offset
+59 when `payload_len >= 63`. Pair it with `health_t`'s `rx_buffer_overflow` (CAN RX queue
+overflow) — together those are the two "we shed frames under load" signals (`tx_drops` = host/NCM
+couldn't keep up; `rx_buffer_overflow` = the loop fell behind draining CAN). Both should read 0
+in normal operation; watch them under armed-mode forwarding load.
+
 ### OBD vs NORMAL routing (which bus a car is read on)
 
 The panda only exposes the **OBD-II port** CAN on **bus 1** in OBD mode (`set_obd`,

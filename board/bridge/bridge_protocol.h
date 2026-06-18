@@ -23,7 +23,10 @@
 #define BRIDGE_HEADER_SIZE 6U
 #define BRIDGE_MAX_DATA    8U                       // classic CAN only over the bridge
 #define BRIDGE_MAX_PACKET  (BRIDGE_HEADER_SIZE + BRIDGE_MAX_DATA)
-#define BRIDGE_MAX_FRAMES_PER_UDP 64U               // matches the Pico bridge batching
+// 100 frames * 14B max = 1400B per datagram — under the 1472B UDP-payload MTU
+// (1500 IP - 20 IP hdr - 8 UDP hdr), so it ships as one Ethernet frame with no IP
+// fragmentation. Don't raise past ~105 or datagrams will fragment.
+#define BRIDGE_MAX_FRAMES_PER_UDP 100U
 
 // DLC code -> data byte count (classic + FD), mirrors the app's table.
 static const uint8_t bridge_dlc_to_len[16] = {0U,1U,2U,3U,4U,5U,6U,7U,8U,12U,16U,20U,24U,32U,48U,64U};

@@ -42,6 +42,10 @@ void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook);
 //   dfu=false -> soft-flasher (reflash the app);  dfu=true -> ST ROM DFU (reflash the bootstub).
 extern void bridge_request_reboot(bool dfu);
 
+// Provided by lwip_glue.c: count of outbound datagrams dropped on a busy NCM TX
+// buffer. Appended to the health push as a bridge-stats trailer (see bridge_send_health).
+extern uint32_t bridge_net_tx_drops(void);
+
 #define BRIDGE_UDP_PORT       5555U
 #define HEARTBEAT_TIMEOUT_MS  500U
 #define KEEPALIVE_INTERVAL_MS 250U
@@ -250,18 +254,29 @@ static void bridge_send_health(uint32_t now_ms) {
   uint8_t resp[64];
   int rlen = comms_control_handler(&pkt, resp);
   if (rlen <= 0) { return; }
-  uint16_t plen = (uint16_t)rlen;
-  if (plen > (uint16_t)sizeof(resp)) { plen = (uint16_t)sizeof(resp); }
+  uint16_t hlen = (uint16_t)rlen;                              // health_t (59 bytes)
+  if (hlen > (uint16_t)sizeof(resp)) { hlen = (uint16_t)sizeof(resp); }
 
-  uint8_t out[RSCR_HDR_LEN + 64];
+  // Payload = packed health_t, then a bridge-stats trailer (PUSH ONLY — the on-demand
+  // 0xD2 reply via process_control has no trailer). See PANDA_HEALTH_PUSH.md.
+  //   [hlen .. hlen+4)  uint32 LE  tx_drops  (NCM-busy datagram drops since boot)
+  uint8_t out[RSCR_HDR_LEN + 80];
   out[0] = (uint8_t)'R'; out[1] = (uint8_t)'S'; out[2] = (uint8_t)'C'; out[3] = (uint8_t)'R';
   out[4] = RSCP_VERSION;
   out[5] = 0xD2U;        // opcode echo
   out[6] = 0U;           // req_id = 0 -> unsolicited push
   out[7] = 0U;           // status: ok
+  memcpy(&out[RSCR_HDR_LEN], resp, hlen);
+
+  uint32_t drops = bridge_net_tx_drops();
+  out[RSCR_HDR_LEN + hlen + 0U] = (uint8_t)(drops & 0xFFU);
+  out[RSCR_HDR_LEN + hlen + 1U] = (uint8_t)((drops >> 8) & 0xFFU);
+  out[RSCR_HDR_LEN + hlen + 2U] = (uint8_t)((drops >> 16) & 0xFFU);
+  out[RSCR_HDR_LEN + hlen + 3U] = (uint8_t)((drops >> 24) & 0xFFU);
+  uint16_t plen = (uint16_t)(hlen + 4U);
+
   out[8] = (uint8_t)(plen & 0xFFU);
   out[9] = (uint8_t)(plen >> 8);
-  memcpy(&out[RSCR_HDR_LEN], resp, plen);
   send_to_client(out, (uint16_t)(RSCR_HDR_LEN + plen));
 }
 
