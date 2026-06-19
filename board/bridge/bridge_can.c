@@ -64,6 +64,14 @@ static uint32_t   current_ms;
 
 static uint8_t tx_buf[BRIDGE_MAX_FRAMES_PER_UDP * BRIDGE_MAX_PACKET];
 static int     tx_buf_len;
+static uint32_t tx_buf_first_ms;   // when the current batch's first frame was queued
+
+// Coalescing: hold a partial datagram up to this long before flushing, so we pack
+// many CAN frames per UDP packet instead of ~1. The main loop spins far faster than
+// frames arrive (~1 frame/550us at 1800 fps), so flushing every poll sent ~1.06
+// frames/packet — paying the full per-datagram lwIP/pbuf/checksum tax ~1800x/s. This
+// bounds the added car->app latency; the near-full check still bounds datagram size.
+#define BRIDGE_TX_COALESCE_MS 5U
 
 // --- RSCP control channel (RoadStud Control Protocol) ------------------------
 // Tunnels the panda's native USB control transfers over UDP, so the app can reach
@@ -258,26 +266,49 @@ static void bridge_send_health(uint32_t now_ms) {
   if (hlen > (uint16_t)sizeof(resp)) { hlen = (uint16_t)sizeof(resp); }
 
   // Payload = packed health_t, then a bridge-stats trailer (PUSH ONLY — the on-demand
-  // 0xD2 reply via process_control has no trailer). See PANDA_HEALTH_PUSH.md.
-  //   [hlen .. hlen+4)  uint32 LE  tx_drops  (NCM-busy datagram drops since boot)
-  uint8_t out[RSCR_HDR_LEN + 80];
+  // 0xD2 reply via process_control has no trailer). See PANDA_HEALTH_PUSH.md / README.
+  //   [hlen .. hlen+4)        uint32 LE  tx_drops            (NCM-busy datagram drops, since boot)
+  //   [hlen+4 .. +3*64)       can_health_t x3 (bus 0,1,2)    (raw 0xC2 layout — bus_off,
+  //                                                           TEC/REC, total_error_cnt, irq rates;
+  //                                                           for armed-mode error-storm diagnosis)
+  uint8_t out[RSCR_HDR_LEN + 80U + (3U * 64U)];
   out[0] = (uint8_t)'R'; out[1] = (uint8_t)'S'; out[2] = (uint8_t)'C'; out[3] = (uint8_t)'R';
   out[4] = RSCP_VERSION;
   out[5] = 0xD2U;        // opcode echo
   out[6] = 0U;           // req_id = 0 -> unsolicited push
   out[7] = 0U;           // status: ok
   memcpy(&out[RSCR_HDR_LEN], resp, hlen);
+  uint16_t off = hlen;
 
   uint32_t drops = bridge_net_tx_drops();
-  out[RSCR_HDR_LEN + hlen + 0U] = (uint8_t)(drops & 0xFFU);
-  out[RSCR_HDR_LEN + hlen + 1U] = (uint8_t)((drops >> 8) & 0xFFU);
-  out[RSCR_HDR_LEN + hlen + 2U] = (uint8_t)((drops >> 16) & 0xFFU);
-  out[RSCR_HDR_LEN + hlen + 3U] = (uint8_t)((drops >> 24) & 0xFFU);
-  uint16_t plen = (uint16_t)(hlen + 4U);
+  out[RSCR_HDR_LEN + off + 0U] = (uint8_t)(drops & 0xFFU);
+  out[RSCR_HDR_LEN + off + 1U] = (uint8_t)((drops >> 8) & 0xFFU);
+  out[RSCR_HDR_LEN + off + 2U] = (uint8_t)((drops >> 16) & 0xFFU);
+  out[RSCR_HDR_LEN + off + 3U] = (uint8_t)((drops >> 24) & 0xFFU);
+  off += 4U;
 
-  out[8] = (uint8_t)(plen & 0xFFU);
-  out[9] = (uint8_t)(plen >> 8);
-  send_to_client(out, (uint16_t)(RSCR_HDR_LEN + plen));
+  // Per-bus can_health via the same 0xC2 handler the app already knows (it refreshes
+  // PSR/ECR via update_can_health_pkt). Lets the app log bus_off + error counters to
+  // catch the armed-mode CAN error storm. Bounded so out[] can never overflow.
+  for (uint8_t bus = 0U; bus < 3U; bus++) {
+    ControlPacket_t cp;
+    cp.request = 0xC2U;
+    cp.param1 = bus;
+    cp.param2 = 0U;
+    cp.length = 64U;
+    uint8_t ch[64];
+    int chlen = comms_control_handler(&cp, ch);
+    if (chlen <= 0) { continue; }
+    uint16_t n = (uint16_t)chlen;
+    if (n > (uint16_t)sizeof(ch)) { n = (uint16_t)sizeof(ch); }
+    if (((uint32_t)off + n) > (uint32_t)(sizeof(out) - RSCR_HDR_LEN)) { break; }
+    memcpy(&out[RSCR_HDR_LEN + off], ch, n);
+    off += n;
+  }
+
+  out[8] = (uint8_t)(off & 0xFFU);
+  out[9] = (uint8_t)(off >> 8);
+  send_to_client(out, (uint16_t)(RSCR_HDR_LEN + off));
 }
 
 void bridge_can_init(void) {
@@ -314,16 +345,22 @@ void bridge_can_poll(uint32_t now_ms) {
     uint32_t budget = BRIDGE_MAX_FRAMES_PER_UDP;
     while ((budget-- > 0U) && can_pop(&can_rx_q, &rxf)) {
       if (rxf.fd != 0U) { continue; }   // bridge classic CAN only
+      if (tx_buf_len == 0) { tx_buf_first_ms = now_ms; }   // start of a new batch
       tx_buf_len += bridge_encode(&rxf, &tx_buf[tx_buf_len]);
       if ((tx_buf_len + (int)BRIDGE_MAX_PACKET) > (int)sizeof(tx_buf)) {
-        flush_tx_buffer();
+        flush_tx_buffer();   // size-bound: datagram full, ship it now
+        last_send_ms = now_ms;
+        last_can_frame_ms = now_ms;
       }
     }
-    if (tx_buf_len > 0) {
+    // Coalesce: ship the batch once it's been held BRIDGE_TX_COALESCE_MS, instead of
+    // every poll — packs many frames per datagram. Size-bound flush above handles
+    // bursts; this is the latency bound for a partial batch.
+    if ((tx_buf_len > 0) && ((now_ms - tx_buf_first_ms) >= BRIDGE_TX_COALESCE_MS)) {
       flush_tx_buffer();
       last_send_ms = now_ms;
       last_can_frame_ms = now_ms;
-    } else if ((now_ms - last_send_ms) > KEEPALIVE_INTERVAL_MS) {
+    } else if ((tx_buf_len == 0) && ((now_ms - last_send_ms) > KEEPALIVE_INTERVAL_MS)) {
       send_keepalive();
       last_send_ms = now_ms;
     }

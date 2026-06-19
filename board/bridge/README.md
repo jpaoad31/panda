@@ -351,13 +351,15 @@ on-demand `0xD2` reply via `process_control` has no trailer, `payload_len = 59`)
 |---|---|---|
 | `[0 .. 58]` | `health_t` | packed panda health struct (`board/health.h`) — unchanged |
 | `[59 .. 62]` | `uint32 LE tx_drops` | outbound datagrams the bridge dropped on a busy NCM TX buffer, since boot |
+| `[63 .. 254]` | `can_health_t` ×3 (bus 0,1,2) | raw `0xC2` per-bus layout — `bus_off`, `transmit/receive_error_cnt`, `total_error_cnt`, `total_rx_lost_cnt`, IRQ call-rates. For diagnosing the armed-mode CAN error storm. |
 
-So the push has `payload_len = 63`. **App side:** an existing `health_t` parser is unaffected
-(reads `[0..58]`); to read the drop count, in the `req_id == 0` branch read `tx_drops` at offset
-59 when `payload_len >= 63`. Pair it with `health_t`'s `rx_buffer_overflow` (CAN RX queue
-overflow) — together those are the two "we shed frames under load" signals (`tx_drops` = host/NCM
-couldn't keep up; `rx_buffer_overflow` = the loop fell behind draining CAN). Both should read 0
-in normal operation; watch them under armed-mode forwarding load.
+So the push is `payload_len = 255` (health_t 59 + tx_drops 4 + 3×can_health 192). **App side:** the
+existing `health_t` parser is unaffected (reads `[0..58]`); read `tx_drops` at offset 59, and the
+three `can_health_t` blocks starting at offset 63 (64 B each, identical to the `0xC2` reply layout).
+Log per-bus `bus_off` + error counters alongside `tx_drops` and `health_t`'s `rx_buffer_overflow`.
+Under armed-mode load these distinguish the failure modes: climbing `transmit_error_cnt`/`bus_off` =
+CAN error storm (the bus is sick); rising `tx_drops` = NCM shedding (host can't keep up);
+`rx_buffer_overflow` = the main loop fell behind draining CAN. All read 0 in normal operation.
 
 ### OBD vs NORMAL routing (which bus a car is read on)
 

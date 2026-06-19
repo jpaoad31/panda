@@ -246,6 +246,24 @@ int main(void) {
   REGISTER_INTERRUPT(OTG_HS_IRQn, bridge_otg_irq, 1500000U, FAULT_INTERRUPT_RATE_USB)
   NVIC_EnableIRQ(OTG_HS_IRQn);
 
+  // Interrupt priority: USB/OTG must out-rank the CAN ISRs (lower number = higher
+  // priority on Cortex-M). When armed, the relay-intercept forwarding floods the
+  // FDCAN interrupts (2x traffic + a forward per frame, and an ACK/error storm if
+  // the intercept upsets the car's bus). With all IRQs at the reset-default 0 they
+  // can't preempt each other, so a CAN storm starves the OTG ISR and the USB link
+  // wedges (needs a replug). Demote the CAN IRQs below OTG so USB always gets
+  // serviced. (The USB *processing* — tud_task/lwIP — still runs in the main loop;
+  // this protects the hardware-level ISR. Throttling the CAN error storm is the
+  // companion fix once the can_health data confirms it.)
+  NVIC_SetPriority(OTG_HS_IRQn, 1U);
+  const IRQn_Type bridge_can_irqs[] = {
+    FDCAN1_IT0_IRQn, FDCAN1_IT1_IRQn, FDCAN2_IT0_IRQn,
+    FDCAN2_IT1_IRQn, FDCAN3_IT0_IRQn, FDCAN3_IT1_IRQn,
+  };
+  for (unsigned int i = 0U; i < (sizeof(bridge_can_irqs) / sizeof(bridge_can_irqs[0])); i++) {
+    NVIC_SetPriority(bridge_can_irqs[i], 2U);
+  }
+
   enable_interrupts();
 
   // TinyUSB device stack on OTG_HS (rhport 1, full speed).
