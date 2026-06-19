@@ -58,8 +58,9 @@ static uint32_t   last_client_packet_ms;
 static uint32_t   last_send_ms;
 static uint32_t   last_can_frame_ms;   // last real CAN frame -> client (not a keepalive)
 // Updated at the top of every bridge_can_poll(); read by the lwIP receive
-// callback (which fires within the same NO_SYS poll loop) so it can timestamp
-// client activity without plumbing now_ms through lwIP.
+// callback (which fires within the same service-ISR tick — tud_task drives
+// netif->input -> udp_recv_cb) so it can timestamp client activity without
+// plumbing now_ms through lwIP.
 static uint32_t   current_ms;
 
 static uint8_t tx_buf[BRIDGE_MAX_FRAMES_PER_UDP * BRIDGE_MAX_PACKET];
@@ -77,9 +78,10 @@ static uint32_t tx_buf_first_ms;   // when the current batch's first frame was q
 // Tunnels the panda's native USB control transfers over UDP, so the app can reach
 // the full comms_control_handler surface (health, version, safety mode, CAN speed,
 // ...) the proprietary USB driver exposed. The request is recognised in the lwIP
-// receive callback but DEFERRED to bridge_can_poll (main-loop context) before
-// calling the handler — some requests re-init CAN / touch the safety hooks (e.g.
-// set_safety_mode), which must not run from the lwIP/USB callback context. A single
+// receive callback but DEFERRED to bridge_can_poll (the service-timer ISR, the
+// single lwIP context) before calling the handler — some requests re-init CAN /
+// touch the safety hooks (e.g. set_safety_mode); the main-loop bridge_safety_tick
+// guards against this with a critical section (see main_bridge.c). A single
 // pending slot is enough: control traffic is low-rate. The app retransmits a request
 // (same req_id) if it misses the reply; we cache the last response and re-ACK a
 // retransmit WITHOUT re-running the handler, so non-idempotent OUT commands
@@ -164,8 +166,9 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
   client_connected = true;
   last_client_packet_ms = current_ms;
 
-  // RSCP control request: stash it and let bridge_can_poll run the handler in
-  // main-loop context (the handler may re-init CAN, unsafe in the lwIP callback).
+  // RSCP control request: stash it and let bridge_can_poll run the handler at the
+  // top of the next service tick (the handler may re-init CAN; deferring it out of
+  // this nested callback keeps the dispatch at a single, well-defined point).
   // Unambiguous vs a CAN batch: a real frame carries a valid XOR checksum at byte[5]
   // (bridge_protocol.h), while an RSCP packet's byte[5] is an opcode (always >=0xA8,
   // never the 0x13 checksum of "RSCP"+ver). So "magic matches AND byte[5] is NOT a
@@ -214,7 +217,7 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 }
 
 // Run a deferred RSCP request through the panda comms handler and reply with RSCR.
-// Called from bridge_can_poll (main-loop context). resp[64] covers every Phase-1
+// Called from bridge_can_poll (the service-timer ISR). resp[64] covers every Phase-1
 // read: health_t is 59 B, can_health_t is 64 B, version/serial are smaller; the
 // panda EP0 path uses the same 64-byte (USBPACKET_MAX_SIZE) response buffer.
 static void process_control(void) {

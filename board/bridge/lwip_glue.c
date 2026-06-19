@@ -50,7 +50,7 @@ static const dhcp_config_t dhcp_config = {
 // forwarding), and (2) re-enters this very output path from tud_task() (incoming
 // frame -> lwIP input -> ARP/ICMP reply -> linkoutput), which NO_SYS lwIP can't do
 // safely. Our traffic is UDP (CAN batches + health pushes) and tolerates loss; the
-// main loop calls tud_task() every iteration, so the TX buffer still drains there.
+// service-timer ISR calls tud_task() at 2 kHz, so the TX buffer still drains there.
 // Count of outbound datagrams dropped because the NCM TX buffer was busy (the
 // non-blocking drop below). Surfaced on the health push so the app can see how
 // often we shed under load. Monotonic since boot.
