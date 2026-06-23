@@ -29,7 +29,8 @@ the bridge is a separate, optional build target.
 ```
 .
 ├── board           # Code that runs on the STM32
-├── python          # Python userspace library for interfacing with the panda
+│   └── bridge      # RoadStud USB-NCM bridge firmware (this fork's addition)
+├── python          # Stock Python userspace library (USB driver — unused by the bridge)
 ├── tests           # Tests for panda
 ├── scripts         # Miscellaneous used for panda development and debugging
 ├── examples        # Example scripts for using a panda in a car
@@ -60,46 +61,31 @@ The above tests are themselves tested by:
 * a [mutation test](tests/misra/test_mutation.py) on the MISRA coverage
 * a [mutation test]([tests/misra/test_mutation.py](https://github.com/commaai/opendbc/blob/master/opendbc/safety/tests/mutation.sh)) on the vehicle-specific safety logic
 
-## Usage
+## Connecting over the network
 
-```bash
-git clone https://github.com/commaai/panda.git
-cd panda
+The bridge firmware makes the panda **plug-and-play over USB-C** — no custom USB driver,
+libusb, udev rules, or Python library. Plugged into a host, it enumerates as a **USB
+Ethernet (CDC-NCM)** adapter and brings up a small lwIP + DHCP stack:
 
-# setup your environment
-./setup.sh
+- The panda is **`192.168.4.1`** and hands the host a `192.168.4.2`–`.4` DHCP lease. The
+  lease advertises **no gateway or DNS**, so the host keeps its own WiFi/cellular as the
+  default route — the panda is just an extra local link.
+- **CAN streams as UDP** to **`192.168.4.1:5555`**. Each datagram is a batch of frames in
+  a compact 6-byte-header wire format; to send CAN to the car the host sends datagrams
+  back to the same socket, and the panda safety model gates what actually transmits.
+- **Control rides the same socket** via **RSCP** (request magic `"RSCP"`, response
+  `"RSCR"`), routed through the panda's own `comms_control_handler` — health, version,
+  set-safety-mode, heartbeat, CAN speed, OBD mux. Health is also **pushed** unsolicited at
+  ~2 Hz so the host never has to poll for it.
 
-# build fw + run the tests
-./test.sh
-```
+So a host connects with nothing more than a UDP socket: take the DHCP lease, open a socket
+to `192.168.4.1:5555`, and you're reading and writing CAN. Because it's plain UDP over a
+standard network interface, it's also trivially observable — `tcpdump`/Wireshark, or a
+few-line probe in any language.
 
-See [the Panda class](https://github.com/commaai/panda/blob/master/python/__init__.py) for how to interact with the panda.
-
-For example, to receive CAN messages:
-``` python
->>> from panda import Panda
->>> panda = Panda()
->>> panda.can_recv()
-```
-And to send one on bus 0:
-``` python
->>> from opendbc.car.structs import CarParams
->>> panda.set_safety_mode(CarParams.SafetyModel.allOutput)
->>> panda.can_send(0x1aa, b'message', 0)
-```
-Note that you may have to setup [udev rules](https://github.com/commaai/panda/tree/master/drivers/linux) for Linux, such as
-``` bash
-sudo tee /etc/udev/rules.d/11-panda.rules <<EOF
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="3801", ATTRS{idProduct}=="ddcc", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="3801", ATTRS{idProduct}=="ddee", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="bbaa", ATTRS{idProduct}=="ddcc", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="bbaa", ATTRS{idProduct}=="ddee", MODE="0666"
-EOF
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-The panda jungle uses different udev rules. See [the repo](https://github.com/commaai/panda_jungle#udev-rules) for instructions.
+The wire format, the RSCP opcodes, the health-push layout, the OBD-vs-NORMAL CAN routing,
+and how to **build + flash** (the bridge builds separately from the stock firmware) are all
+documented in **[`board/bridge/README.md`](board/bridge/README.md)**.
 
 ## Licensing
 
