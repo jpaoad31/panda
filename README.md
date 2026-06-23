@@ -6,20 +6,24 @@ panda speaks CAN and CAN FD, and it runs on the [STM32H725](https://www.st.com/r
 
 This is a fork of comma's panda with one addition: a dedicated **USB-CDC-NCM firmware**
 (`board/bridge/`) that turns a panda into a direct USB-C CAN interface for the
-**RoadStud** iOS driver-assistance app — no Pico/WiFi bridge in between. The panda
+**RoadStud** iOS driver-assistance app. The panda
 enumerates as a USB Ethernet device, runs a small lwIP/DHCP stack, and streams CAN over
-UDP (the panda packet format) to `192.168.4.1:5555`, so the app connects unchanged. It
+UDP (the panda packet format) to `192.168.4.1:5555`, so the app can communicate with a car
+over an existing native iOS interface. It
 also tunnels the panda's **native control transfers** over the same socket (an "RSCP"
 request/response routed through `comms_control_handler`), so the host gets the full
 control surface — health, set-safety-mode, heartbeat, CAN speed, OBD mux — that the
 proprietary USB driver exposed, including actuation (a 1 Hz safety/heartbeat tick gates
 controls just like stock).
 
-**Status: validated on hardware** — a red panda flashed with this firmware streams live
-CAN (read a Hyundai over OBD, ~9k frames/s across 29 IDs) to a host over USB-NCM, and
-the RSCP control plane (health round-trip, safety-mode + heartbeat gating) is validated.
-Build, flash (incl. a recoverable dev bootstub with a boot-time flash window), and
-comms-test tooling are documented in **[`board/bridge/README.md`](board/bridge/README.md)**.
+**Status: streaming validated on hardware; actuation in progress.** A red panda flashed
+with this firmware streams live CAN over USB-NCM to a host. The important target is a
+**2017 Toyota RAV4** (a supported car): read-only is validated — CAN decodes to the correct
+vehicle state at ~3k frames/s — and the RSCP control plane (health round-trip, safety-mode
++ heartbeat gating) works. **End-to-end actuation on the RAV4 isn't working yet**; the
+remaining issue appears to be app-side. (A Hyundai was also smoke-tested over OBD at ~2k frames/s.) Build,
+flash (incl. a recoverable dev bootstub with a boot-time flash window), and comms-test
+tooling are documented in **[`board/bridge/README.md`](board/bridge/README.md)**.
 
 Everything else is stock panda — the safety model and standard firmware are unchanged;
 the bridge is a separate, optional build target.
