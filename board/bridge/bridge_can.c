@@ -35,6 +35,7 @@ typedef struct can_ring can_ring;
 extern can_ring can_rx_q;
 bool can_pop(can_ring *q, CANPacket_t *elem);
 void can_send(CANPacket_t *to_push, uint8_t bus_number, bool skip_tx_hook);
+void can_set_checksum(CANPacket_t *packet);
 
 // Provided by main_bridge.c: set the bootstub re-entry magic + reset. The NCM app
 // has no panda control endpoint, so a host can't request enter-bootstub the usual
@@ -111,7 +112,7 @@ static uint32_t last_health_ms;
 static void flush_tx_buffer(void) {
   if ((tx_buf_len == 0) || !client_connected) { return; }
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)tx_buf_len, PBUF_RAM);
-  if (p == NULL) { return; }
+  if (p == NULL) { tx_buf_len = 0; return; }  // drop batch: a full buffer here overflows on the next encode
   memcpy(p->payload, tx_buf, (size_t)tx_buf_len);
   udp_sendto(can_udp, p, &client_addr, client_port);
   pbuf_free(p);
@@ -206,6 +207,10 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
       CANPacket_t pkt;
       int consumed = bridge_decode(&data[offset], remaining - offset, &pkt);
       if (consumed <= 0) { break; }
+      // The TX drain (fdcan.h) verifies the internal struct checksum and silently
+      // drops the frame otherwise — bridge_decode builds the struct raw, so it
+      // must be stamped here (the native USB path gets it from the host library).
+      can_set_checksum(&pkt);
       // NOTE: skip_tx_hook=false runs the panda safety model. For a forwarding
       // bridge you must set an appropriate safety mode (or pass true to forward
       // raw) — see README "Safety mode".
@@ -348,6 +353,9 @@ void bridge_can_poll(uint32_t now_ms) {
     uint32_t budget = BRIDGE_MAX_FRAMES_PER_UDP;
     while ((budget-- > 0U) && can_pop(&can_rx_q, &rxf)) {
       if (rxf.fd != 0U) { continue; }   // bridge classic CAN only
+      // TX echoes (returned) and safety-rejected copies share can_rx_q; the wire
+      // format has no flags for them, so they'd arrive as phantom bus-0 RX.
+      if ((rxf.returned != 0U) || (rxf.rejected != 0U)) { continue; }
       if (tx_buf_len == 0) { tx_buf_first_ms = now_ms; }   // start of a new batch
       tx_buf_len += bridge_encode(&rxf, &tx_buf[tx_buf_len]);
       if ((tx_buf_len + (int)BRIDGE_MAX_PACKET) > (int)sizeof(tx_buf)) {
