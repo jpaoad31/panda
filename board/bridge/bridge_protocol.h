@@ -21,7 +21,7 @@
 #include <string.h>
 
 #define BRIDGE_HEADER_SIZE 6U
-#define BRIDGE_MAX_DATA    8U                       // classic CAN only over the bridge
+#define BRIDGE_MAX_DATA    64U                      // classic CAN (<=8) + CAN FD (<=64)
 #define BRIDGE_MAX_PACKET  (BRIDGE_HEADER_SIZE + BRIDGE_MAX_DATA)
 // 100 frames * 14B max = 1400B per datagram — under the 1472B UDP-payload MTU
 // (1500 IP - 20 IP hdr - 8 UDP hdr), so it ships as one Ethernet frame with no IP
@@ -39,14 +39,14 @@ static inline uint8_t bridge_len_to_dlc(uint8_t len) {
 }
 
 // Encode one panda CANPacket_t into the bridge wire format at `buf`.
-// Returns bytes written. FD frames are not bridged (classic CAN only) — the
-// caller should skip pkt->fd != 0 before calling.
+// Returns bytes written. Carries classic and CAN-FD frames (data up to 64 bytes);
+// the FD flag rides bit 0 of buf[0] so the peer can reconstruct pkt->fd.
 static inline int bridge_encode(const CANPacket_t *pkt, uint8_t *buf) {
   uint8_t dlc = (uint8_t)(pkt->data_len_code & 0x0FU);
   uint8_t data_len = bridge_dlc_to_len[dlc];
   if (data_len > BRIDGE_MAX_DATA) { data_len = BRIDGE_MAX_DATA; }
 
-  buf[0] = (uint8_t)((dlc << 4) | ((pkt->bus & 0x07U) << 1));   // FD bit left 0
+  buf[0] = (uint8_t)((dlc << 4) | ((pkt->bus & 0x07U) << 1) | (pkt->fd ? 1U : 0U));
   uint32_t addr = (uint32_t)pkt->addr;
   buf[1] = (uint8_t)(addr >> 24);
   buf[2] = (uint8_t)(addr >> 16);
@@ -65,6 +65,7 @@ static inline int bridge_decode(const uint8_t *buf, int buf_len, CANPacket_t *pk
 
   uint8_t dlc = (uint8_t)(buf[0] >> 4);
   uint8_t bus = (uint8_t)((buf[0] >> 1) & 0x07U);
+  uint8_t is_fd = (uint8_t)(buf[0] & 0x01U);
   uint8_t data_len = bridge_dlc_to_len[dlc & 0x0FU];
   if (data_len > BRIDGE_MAX_DATA) { data_len = BRIDGE_MAX_DATA; }
 
@@ -79,7 +80,7 @@ static inline int bridge_decode(const uint8_t *buf, int buf_len, CANPacket_t *pk
   pkt->bus = (uint8_t)(bus & 0x07U);
   pkt->data_len_code = bridge_len_to_dlc(data_len);
   pkt->extended = (addr > 0x7FFU) ? 1U : 0U;      // >11 bits -> extended ID
-  pkt->fd = 0U;
+  pkt->fd = is_fd;
   memcpy(pkt->data, &buf[6], data_len);
   return (int)(BRIDGE_HEADER_SIZE + data_len);
 }
