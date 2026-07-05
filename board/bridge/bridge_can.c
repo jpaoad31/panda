@@ -96,15 +96,49 @@ static uint32_t tx_buf_first_ms;   // when the current batch's first frame was q
 #define RSCR_HDR_LEN 10U
 #define RSCP_VERSION 1U
 
-static bool            ctrl_pending;
-static ControlPacket_t ctrl_req;
-static uint8_t         ctrl_req_id;
+// Pending-request FIFO: the app does not serialize control requests (its heartbeat
+// shares this path), so several can arrive within one tud_task service before
+// process_control drains them. A single slot would drop all but the last and let a
+// retransmit reorder them; a small ring drained in order fixes both. Enqueue (in
+// udp_recv_cb via tud_task) and drain (in process_control via bridge_can_poll) both
+// run in the same service tick, so no critical section is needed.
+#define CTRL_PENDING_SLOTS 4U
+typedef struct {
+  ControlPacket_t req;
+  uint8_t         req_id;
+} ctrl_pending_t;
+static ctrl_pending_t ctrl_pending_q[CTRL_PENDING_SLOTS];
+static uint8_t        ctrl_pending_head;   // next to drain
+static uint8_t        ctrl_pending_count;  // queued but not drained
 
-// Last handled request's reply, cached for idempotent re-ACK of retransmits. The
-// app's req_id is 1..255 (never 0), so last_done_reqid == 0 means "nothing yet".
-static uint8_t  last_done_reqid;
-static uint16_t cached_resp_len;
-static uint8_t  cached_resp[RSCR_HDR_LEN + 64];
+// Response cache: a small ring of recent replies for idempotent re-ACK of a
+// retransmit WITHOUT re-running the handler, so non-idempotent OUT commands
+// (set_safety_mode, set_obd, ...) execute exactly once. Keyed on BOTH req_id and
+// opcode: after a reconnect the app restarts req_ids at 1, and the opcode check
+// stops a stale entry from answering a different command that reused the id. The
+// app's req_id is 1..255 (never 0), so req_id == 0 marks an empty slot.
+#define CTRL_CACHE_SLOTS 8U
+typedef struct {
+  uint8_t  req_id;
+  uint8_t  opcode;
+  uint16_t resp_len;
+  uint8_t  resp[RSCR_HDR_LEN + 64];
+} ctrl_cache_t;
+static ctrl_cache_t ctrl_cache[CTRL_CACHE_SLOTS];
+static uint8_t      ctrl_cache_next;   // round-robin write cursor
+
+// Wipe all control-plane session state. Called on a client change (reconnect / new
+// app instance) so a fresh session's req_ids can't collide with a prior session's
+// cache and get answered from stale data.
+static void ctrl_reset_session(void) {
+  ctrl_pending_head = 0U;
+  ctrl_pending_count = 0U;
+  ctrl_cache_next = 0U;
+  for (uint8_t i = 0U; i < CTRL_CACHE_SLOTS; i++) {
+    ctrl_cache[i].req_id = 0U;
+    ctrl_cache[i].resp_len = 0U;
+  }
+}
 
 // Periodic unsolicited health push throttle (see bridge_send_health).
 static uint32_t last_health_ms;
@@ -162,6 +196,11 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
   if (sentinel_is(p, "RSDFUAPP")) { pbuf_free(p); bridge_request_reboot(false); return; }
   if (sentinel_is(p, "RSDFUBTL")) { pbuf_free(p); bridge_request_reboot(true);  return; }
 
+  // A different source address/port means a reconnect or a new app instance; drop
+  // the prior session's cached responses so its req_ids can't answer this one.
+  if (client_connected && (!ip_addr_cmp(&client_addr, addr) || (client_port != port))) {
+    ctrl_reset_session();
+  }
   ip_addr_copy(client_addr, *addr);
   client_port = port;
   client_connected = true;
@@ -180,20 +219,43 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         (d[0] == (uint8_t)'R') && (d[1] == (uint8_t)'S') &&
         (d[2] == (uint8_t)'C') && (d[3] == (uint8_t)'P') &&
         ((uint8_t)(d[0] ^ d[1] ^ d[2] ^ d[3] ^ d[4]) != d[5])) {   // not a valid CAN header
-      uint8_t reqid = d[6];
-      // Retransmit of the request we just handled: re-ACK from cache, don't re-run
-      // (so OUT commands like set_safety_mode execute exactly once).
-      if ((reqid == last_done_reqid) && (cached_resp_len > 0U)) {
-        send_to_client(cached_resp, cached_resp_len);
-        pbuf_free(p);
-        return;
+      uint8_t reqid  = d[6];
+      uint8_t opcode = d[5];
+
+      // Retransmit of a request we already handled: re-ACK from cache, don't re-run
+      // (so OUT commands like set_safety_mode execute exactly once). Match req_id AND
+      // opcode so a reused id from a new session can't get a stale reply.
+      for (uint8_t i = 0U; i < CTRL_CACHE_SLOTS; i++) {
+        if ((ctrl_cache[i].req_id == reqid) && (ctrl_cache[i].opcode == opcode) &&
+            (ctrl_cache[i].resp_len > 0U)) {
+          send_to_client(ctrl_cache[i].resp, ctrl_cache[i].resp_len);
+          pbuf_free(p);
+          return;
+        }
       }
-      ctrl_req.request = d[5];
-      ctrl_req.param1  = (uint16_t)((uint16_t)d[8]  | ((uint16_t)d[9]  << 8));
-      ctrl_req.param2  = (uint16_t)((uint16_t)d[10] | ((uint16_t)d[11] << 8));
-      ctrl_req.length  = (uint16_t)((uint16_t)d[12] | ((uint16_t)d[13] << 8));
-      ctrl_req_id  = reqid;
-      ctrl_pending = true;
+
+      // Retransmit of a request still queued (not yet handled): drop it — it will be
+      // processed once, then future retransmits hit the cache above.
+      for (uint8_t i = 0U; i < ctrl_pending_count; i++) {
+        const ctrl_pending_t *q = &ctrl_pending_q[(ctrl_pending_head + i) % CTRL_PENDING_SLOTS];
+        if ((q->req_id == reqid) && (q->req.request == opcode)) {
+          pbuf_free(p);
+          return;
+        }
+      }
+
+      // New request: enqueue for process_control (deferred out of this nested lwIP
+      // callback since the handler may re-init CAN). If the FIFO is full, drop it —
+      // the app retransmits, and the FIFO drains within a tick or two at 2 kHz.
+      if (ctrl_pending_count < CTRL_PENDING_SLOTS) {
+        ctrl_pending_t *slot = &ctrl_pending_q[(ctrl_pending_head + ctrl_pending_count) % CTRL_PENDING_SLOTS];
+        slot->req.request = opcode;
+        slot->req.param1  = (uint16_t)((uint16_t)d[8]  | ((uint16_t)d[9]  << 8));
+        slot->req.param2  = (uint16_t)((uint16_t)d[10] | ((uint16_t)d[11] << 8));
+        slot->req.length  = (uint16_t)((uint16_t)d[12] | ((uint16_t)d[13] << 8));
+        slot->req_id      = reqid;
+        ctrl_pending_count++;
+      }
       pbuf_free(p);
       return;
     }
@@ -226,29 +288,38 @@ static void udp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 // read: health_t is 59 B, can_health_t is 64 B, version/serial are smaller; the
 // panda EP0 path uses the same 64-byte (USBPACKET_MAX_SIZE) response buffer.
 static void process_control(void) {
-  if (!ctrl_pending) { return; }
-  ctrl_pending = false;
+  // Drain the whole FIFO in arrival order (bounded by CTRL_PENDING_SLOTS). Each
+  // reply is stored in a cache ring slot so a later retransmit re-ACKs without
+  // re-running the handler.
+  while (ctrl_pending_count > 0U) {
+    ctrl_pending_t req = ctrl_pending_q[ctrl_pending_head];
+    ctrl_pending_head = (uint8_t)((ctrl_pending_head + 1U) % CTRL_PENDING_SLOTS);
+    ctrl_pending_count--;
 
-  uint8_t resp[64];
-  if (ctrl_req.length > (uint16_t)sizeof(resp)) { ctrl_req.length = (uint16_t)sizeof(resp); }
-  int rlen = comms_control_handler(&ctrl_req, resp);   // may not return (reset/DFU opcodes)
-  uint16_t plen = (rlen > 0) ? (uint16_t)rlen : 0U;
-  if (plen > (uint16_t)sizeof(resp)) { plen = (uint16_t)sizeof(resp); }   // defense-in-depth vs a future handler
+    uint8_t resp[64];
+    if (req.req.length > (uint16_t)sizeof(resp)) { req.req.length = (uint16_t)sizeof(resp); }
+    int rlen = comms_control_handler(&req.req, resp);   // may not return (reset/DFU opcodes)
+    uint16_t plen = (rlen > 0) ? (uint16_t)rlen : 0U;
+    if (plen > (uint16_t)sizeof(resp)) { plen = (uint16_t)sizeof(resp); }   // defense-in-depth vs a future handler
 
-  // Build the RSCR into the cache so a retransmit can be re-ACKed without re-running.
-  uint8_t *o = cached_resp;
-  o[0] = (uint8_t)'R'; o[1] = (uint8_t)'S'; o[2] = (uint8_t)'C'; o[3] = (uint8_t)'R';
-  o[4] = RSCP_VERSION;
-  o[5] = ctrl_req.request;
-  o[6] = ctrl_req_id;
-  o[7] = 0U;                          // status: reserved (handler has no error channel)
-  o[8] = (uint8_t)(plen & 0xFFU);
-  o[9] = (uint8_t)(plen >> 8);
-  if (plen > 0U) { memcpy(&o[RSCR_HDR_LEN], resp, plen); }
-  cached_resp_len = (uint16_t)(RSCR_HDR_LEN + plen);
-  last_done_reqid = ctrl_req_id;
+    // Build the RSCR into a fresh cache slot (round-robin eviction of the oldest).
+    ctrl_cache_t *c = &ctrl_cache[ctrl_cache_next];
+    ctrl_cache_next = (uint8_t)((ctrl_cache_next + 1U) % CTRL_CACHE_SLOTS);
+    uint8_t *o = c->resp;
+    o[0] = (uint8_t)'R'; o[1] = (uint8_t)'S'; o[2] = (uint8_t)'C'; o[3] = (uint8_t)'R';
+    o[4] = RSCP_VERSION;
+    o[5] = req.req.request;
+    o[6] = req.req_id;
+    o[7] = 0U;                          // status: reserved (handler has no error channel)
+    o[8] = (uint8_t)(plen & 0xFFU);
+    o[9] = (uint8_t)(plen >> 8);
+    if (plen > 0U) { memcpy(&o[RSCR_HDR_LEN], resp, plen); }
+    c->resp_len = (uint16_t)(RSCR_HDR_LEN + plen);
+    c->opcode   = req.req.request;
+    c->req_id   = req.req_id;           // set last: makes the slot matchable only when complete
 
-  send_to_client(cached_resp, cached_resp_len);
+    send_to_client(c->resp, c->resp_len);
+  }
 }
 
 // Periodic unsolicited health push (~2 Hz): an RSCR with req_id=0. The app never uses
