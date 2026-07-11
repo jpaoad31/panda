@@ -16,14 +16,14 @@ control surface — health, set-safety-mode, heartbeat, CAN speed, OBD mux — t
 proprietary USB driver exposed, including actuation (a 1 Hz safety/heartbeat tick gates
 controls just like stock).
 
-**Status: streaming validated on hardware; actuation in progress.** A red panda flashed
-with this firmware streams live CAN over USB-NCM to a host. The important target is a
-**2017 Toyota RAV4** (a supported car): read-only is validated — CAN decodes to the correct
-vehicle state at ~3k frames/s — and the RSCP control plane (health round-trip, safety-mode
-+ heartbeat gating) works. **End-to-end actuation on the RAV4 isn't working yet**; the
-remaining issue appears to be app-side. (A Hyundai was also smoke-tested over OBD at ~2k frames/s.) Build,
-flash (incl. a recoverable dev bootstub with a boot-time flash window), and comms-test
-tooling are documented in **[`board/bridge/README.md`](board/bridge/README.md)**.
+**Status: validated on hardware, including actuation.** A red panda flashed with this
+firmware streams live CAN over USB-NCM to a host. On a **2017 Toyota RAV4** (a supported
+car): CAN decodes to the correct vehicle state at ~3k frames/s, the RSCP control plane
+(health round-trip, safety-mode + heartbeat gating) works, and **first real steering
+actuation is confirmed** — the panda's safety model plus a 1 Hz heartbeat tick gate the
+controls just like stock. (A Hyundai was also read over OBD at ~2k frames/s.) Build, flash
+(incl. a recoverable dev bootstub with a boot-time flash window), and comms-test tooling
+are documented in **[`board/bridge/README.md`](board/bridge/README.md)**.
 
 Everything else is stock panda — the safety model and standard firmware are unchanged;
 the bridge is a separate, optional build target.

@@ -113,9 +113,12 @@ A **red panda** flashed with this firmware was driven end-to-end from a Linux ho
 `192.168.4.2` from its DHCP server, and streamed **~1800 CAN frames/s across 29 unique
 IDs** over the panda-bridge UDP protocol — verified with `board/bridge/tools/bridge_test.py`
 (the host standing in for the iPhone). NCM + lwIP + DHCP + FDCAN read + the signing/boot
-chain all work. (A USB-C-only Mac could **not** enumerate the panda — its USB-A device
-port needs a real USB-A host; a Pi or USB-A machine is the reliable host, see the Pi
-build section above.)
+chain all work. Since then, **first real steering actuation on a 2017 Toyota RAV4 is
+confirmed** (set-safety-mode + 2 Hz heartbeat gating the controls). Either a Raspberry Pi
+or a **Mac** works as the flash/comms host — a Mac enumerates the panda over a proper cable
+and flashes it directly with `board/bridge/tools/flash_app.py` from the local venv
+(`board/bridge/macos_build.sh` builds it); an earlier note that a USB-C Mac "couldn't
+enumerate" was a bad-cable issue, now resolved.
 
 `board/obj/panda_bridge/main.{elf,bin}` builds end-to-end (text ~94 KB, data ~23 KB,
 bss ~455 KB — fits the H7 RAM regions). Build it:
